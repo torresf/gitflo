@@ -1,3 +1,5 @@
+<img src="design/icon.png" alt="" width="80" align="right">
+
 # gitflo
 
 A native macOS viewer for git branches and commits across many repositories.
