@@ -75,6 +75,21 @@ The subtlest part, ~200 lines, some thirty tests. Two invariants:
 Both were violated once each, with a visible symptom: floating strokes beside
 merges, then a gap between a merge and the branch it merged.
 
+## Assets
+
+`design/icon.svg` is the app icon source; `design/social-preview.svg` the
+GitHub share card. Both render through resvg:
+
+```bash
+node scripts/render-icon.mjs && npm run tauri icon design/icon.png
+```
+
+⚠ resvg does not support `oklch()` and silently drops the stroke — write hex in
+these files even though the app itself uses OKLCH.
+
+The social preview is uploaded by hand: GitHub → Settings → General → Social
+preview. A repository cannot have an avatar of its own.
+
 ## Open leads (contributions welcome)
 
 - **Fetch every repository** in one action (the per-repository command exists).

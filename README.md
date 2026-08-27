@@ -1,4 +1,4 @@
-<img src="design/icon.png" alt="" width="80" align="right">
+<img src="design/icon.png" alt="" width="72">
 
 # gitflo
 
