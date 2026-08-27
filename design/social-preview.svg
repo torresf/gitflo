@@ -6,30 +6,34 @@
 
   <!-- The app icon, redrawn here rather than embedded, so this file stays
        editable text. -->
-  <g transform="translate(150 196) scale(0.25)">
+  <g transform="translate(150 156) scale(0.25)">
     <rect width="1024" height="1024" rx="228" fill="#10151E"/>
     <rect x="5" y="5" width="1014" height="1014" rx="223" fill="none" stroke="#2A2F3A" stroke-width="10"/>
     <circle cx="512" cy="512" r="248" fill="#ffffff"/>
     <circle cx="512" cy="512" r="176" fill="#10151E"/>
   </g>
 
-  <text x="440" y="300" fill="#ffffff" font-family="-apple-system, Helvetica, Arial, sans-serif"
+  <text x="440" y="260" fill="#ffffff" font-family="-apple-system, Helvetica, Arial, sans-serif"
         font-size="104" font-weight="700">gitflo</text>
-  <text x="440" y="360" fill="#8b95a7" font-family="-apple-system, Helvetica, Arial, sans-serif"
+  <text x="440" y="320" fill="#8b95a7" font-family="-apple-system, Helvetica, Arial, sans-serif"
         font-size="34">Git branches and commits, across every repository</text>
 
   <!-- Lane colours from the app: green trunk, blue integration, then the ramp.
        Written as hex, not oklch(): resvg does not support that notation and
-       silently drops the stroke. -->
+       silently drops the stroke.
+
+       x is offset by half the stroke width relative to the text: a round
+       linecap sits centred on x, so its left edge would otherwise stick out
+       past the column the text starts on. -->
   <g stroke-width="8" stroke-linecap="round">
-    <line x1="440" y1="416" x2="440" y2="472" stroke="#57d38c"/>
-    <line x1="478" y1="416" x2="478" y2="472" stroke="#4c9aff"/>
-    <line x1="516" y1="416" x2="516" y2="472" stroke="#c48af5"/>
-    <line x1="554" y1="416" x2="554" y2="472" stroke="#f28cae"/>
-    <line x1="592" y1="416" x2="592" y2="472" stroke="#f0917c"/>
-    <line x1="630" y1="416" x2="630" y2="472" stroke="#d3a552"/>
+    <line x1="444" y1="376" x2="444" y2="432" stroke="#57d38c"/>
+    <line x1="482" y1="376" x2="482" y2="432" stroke="#4c9aff"/>
+    <line x1="520" y1="376" x2="520" y2="432" stroke="#c48af5"/>
+    <line x1="558" y1="376" x2="558" y2="432" stroke="#f28cae"/>
+    <line x1="596" y1="376" x2="596" y2="432" stroke="#f0917c"/>
+    <line x1="634" y1="376" x2="634" y2="432" stroke="#d3a552"/>
   </g>
 
-  <text x="440" y="524" fill="#5c6675" font-family="ui-monospace, Menlo, monospace"
+  <text x="440" y="484" fill="#5c6675" font-family="ui-monospace, Menlo, monospace"
         font-size="26">macOS · Tauri · MIT</text>
 </svg>
