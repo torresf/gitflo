@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- gitflo app icon: a trunk with two branches leaving it at different
+       heights, each ending on its own commit.
+
+       The branches rise and STOP on a dot instead of running to the bottom:
+       branches drawn as full-height descenders read as a letter (earlier
+       versions drew an "h"). Ending them on a tip also matches what the app
+       shows — a branch stops at its newest commit.
+
+       Attributes are per element, not inherited from a group: some SVG
+       rasterisers drop inherited stroke properties entirely. -->
+  <rect width="1024" height="1024" rx="228" fill="#0b0d11"/>
+  <rect x="10" y="10" width="1004" height="1004" rx="220" fill="none" stroke="#2a2f3a" stroke-width="20"/>
+
+  <!-- trunk -->
+  <path d="M512 168 V 856" fill="none" stroke="#ffffff" stroke-width="88" stroke-linecap="round"/>
+  <!-- branch leaving to the right, rising to its tip -->
+  <path d="M512 452 C 512 330, 764 386, 764 286"
+        fill="none" stroke="#ffffff" stroke-width="88" stroke-linecap="round"/>
+  <!-- branch leaving to the left, lower, rising to its tip -->
+  <path d="M512 700 C 512 578, 260 634, 260 534"
+        fill="none" stroke="#ffffff" stroke-width="88" stroke-linecap="round"/>
+
+  <circle cx="764" cy="286" r="86" fill="#ffffff"/>
+  <circle cx="260" cy="534" r="86" fill="#ffffff"/>
+</svg>

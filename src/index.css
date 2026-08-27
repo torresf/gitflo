@@ -1,0 +1,82 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink-950: #0d1117;
+  --color-ink-900: #12171f;
+  --color-ink-850: #161c26;
+  --color-ink-800: #1c2330;
+  --color-ink-700: #242c3b;
+  --color-ink-600: #313a4b;
+  --color-ink-500: #4a5568;
+  --color-ink-400: #6b7789;
+  --color-ink-300: #949fb0;
+  --color-ink-200: #c3cad5;
+  --color-ink-100: #e6eaf0;
+
+  --color-accent: #4c9aff;
+  --color-ahead: #57d38c;
+  --color-behind: #f0a35e;
+  --color-danger: #f4657a;
+
+  --font-mono: "SF Mono", "JetBrains Mono", ui-monospace, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  background: var(--color-ink-950);
+  color: var(--color-ink-100);
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  /* WKWebView honours the prefixed property; without it a right-click or a
+     double-click still selects the word under the pointer. */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Anything explicitly selectable has to opt back in on BOTH properties. */
+.select-text,
+input,
+textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Every actionable control gets a pointer, disabled ones do not. Done globally
+   rather than per component: this app is almost entirely buttons, and one that
+   was missed read as decoration. */
+button:not(:disabled),
+[role="button"]:not([aria-disabled="true"]),
+label:has(input[type="checkbox"]:not(:disabled)) {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: default;
+}
+
+/* Thin overlay scrollbars, in keeping with native macOS panes. */
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-ink-600);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-ink-500);
+  background-clip: content-box;
+}

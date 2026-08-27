@@ -1,0 +1,35 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g clip-path="url(#clip0_1_10)">
+<path d="M796 0H228C102.079 0 0 102.079 0 228V796C0 921.921 102.079 1024 228 1024H796C921.921 1024 1024 921.921 1024 796V228C1024 102.079 921.921 0 796 0Z" fill="#10151E"/>
+<path d="M796 0H228C102.079 0 0 102.079 0 228V796C0 921.921 102.079 1024 228 1024H796C921.921 1024 1024 921.921 1024 796V228C1024 102.079 921.921 0 796 0Z" fill="url(#paint0_linear_1_10)" fill-opacity="0.47"/>
+<path d="M224.383 5H799.617C920.779 5 1019 103.221 1019 224.383V799.617C1019 920.779 920.779 1019 799.617 1019H224.383C103.221 1019 5 920.779 5 799.617V224.383C5 103.221 103.221 5 224.383 5Z" stroke="#2A2F3A" stroke-width="10"/>
+<path d="M224.383 5H799.617C920.779 5 1019 103.221 1019 224.383V799.617C1019 920.779 920.779 1019 799.617 1019H224.383C103.221 1019 5 920.779 5 799.617V224.383C5 103.221 103.221 5 224.383 5Z" stroke="url(#paint1_linear_1_10)" stroke-opacity="0.2" stroke-width="10"/>
+<path d="M512 760C648.967 760 760 648.967 760 512C760 375.033 648.967 264 512 264C375.033 264 264 375.033 264 512C264 648.967 375.033 760 512 760Z" fill="white"/>
+<g filter="url(#filter0_d_1_10)">
+<path d="M512 688C609.202 688 688 609.202 688 512C688 414.798 609.202 336 512 336C414.798 336 336 414.798 336 512C336 609.202 414.798 688 512 688Z" fill="#10151E"/>
+</g>
+</g>
+<defs>
+<filter id="filter0_d_1_10" x="284.1" y="288.1" width="455.8" height="455.8" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+<feOffset dy="4"/>
+<feGaussianBlur stdDeviation="25.95"/>
+<feComposite in2="hardAlpha" operator="out"/>
+<feColorMatrix type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.68 0"/>
+<feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow_1_10"/>
+<feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_1_10" result="shape"/>
+</filter>
+<linearGradient id="paint0_linear_1_10" x1="512" y1="0" x2="512" y2="1024" gradientUnits="userSpaceOnUse">
+<stop stop-opacity="0"/>
+<stop offset="1"/>
+</linearGradient>
+<linearGradient id="paint1_linear_1_10" x1="512" y1="0" x2="512" y2="1024" gradientUnits="userSpaceOnUse">
+<stop stop-color="#666666"/>
+<stop offset="1"/>
+</linearGradient>
+<clipPath id="clip0_1_10">
+<rect width="1024" height="1024" fill="white"/>
+</clipPath>
+</defs>
+</svg>
