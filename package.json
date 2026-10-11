@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "install-local": "sh scripts/install-local.sh",
     "test": "vitest run",
     "test:watch": "vitest"
   },

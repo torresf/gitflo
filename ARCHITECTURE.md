@@ -11,7 +11,12 @@ npm install
 npm run tauri dev           # dev, hot reload on the front
 npm test                    # ~190 front tests (vitest)
 cd src-tauri && cargo test  # git parsers
+npm run install-local       # build, replace /Applications/gitflo.app, relaunch
 ```
+
+Bump the version in `package.json`, `src-tauri/tauri.conf.json` and
+`src-tauri/Cargo.toml` together before installing a release, so the installed
+app says which one it is.
 
 Opt-in tests, replayed against real repositories (skipped by default):
 
