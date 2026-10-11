@@ -127,3 +127,21 @@ export interface RemoteBranchState {
   contributesNothing: boolean;
   hasLocal: boolean;
 }
+
+/** How a pull reconciles a branch that diverged from its upstream. */
+export type PullMode = "rebase" | "merge" | "ff-only";
+
+export interface FetchOutcome {
+  repo: string;
+  ok: boolean;
+  output: string;
+}
+
+/** Web home of a repo's remote, e.g. https://github.com/owner/repo. */
+export interface WebRemote {
+  base: string;
+  kind: "github" | "gitlab" | "bitbucket" | "other";
+}
+
+/** Editor "Ouvrir dans l'éditeur" launches. */
+export type Editor = "vscode" | "cursor" | "zed";

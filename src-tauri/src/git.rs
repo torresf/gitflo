@@ -1,6 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -11,26 +15,204 @@ const FS: char = '\x1f';
 ///
 /// Deliberately NOT NUL: `Command::arg` rejects a NUL byte outright (args are
 /// C strings), so a `%x00` separator would fail the spawn, not the parse.
+/// NUL is fine in git's OUTPUT, which is why path lists are read with `-z`.
 const RS: char = '\x1e';
 
-fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+/// The one place a git command is built, so no invocation can miss part of
+/// the environment.
+fn git_command(cwd: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    // Raw UTF-8 paths instead of C-quoted ones (`"caf\303\251.txt"`) in the
+    // diff headers shown verbatim; the parsers read `-z` output regardless.
+    cmd.args(["-c", "core.quotePath=false"])
         .args(args)
         .current_dir(cwd)
         // Never let git try to open an interactive prompt: a hung askpass
         // would freeze the whole app with no visible cause.
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .map_err(|e| format!("failed to spawn git: {e}"))?;
+        // English messages whatever the user's locale: the front recognises
+        // refusals by their text ("not fully merged", "Directory not empty"),
+        // and a translated git (Homebrew's is) would silently defeat that.
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "C")
+        // Not a terminal either: merge then never opens an editor.
+        .stdin(Stdio::null());
+    cmd
+}
 
+fn git_output(cwd: &Path, args: &[&str]) -> Result<Output, String> {
+    git_command(cwd, args)
+        .output()
+        .map_err(|e| format!("failed to spawn git: {e}"))
+}
+
+/// Everything git said about a failure: stderr (the error itself) THEN
+/// stdout, where merge and rebase print their CONFLICT lines.
+fn failure_message(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parts: Vec<&str> = [stderr.trim(), stdout.trim()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        format!("git a échoué ({})", output.status)
+    } else {
+        parts.join("\n")
+    }
+}
+
+/// Pure stdout on success: what the parsers need.
+fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let output = git_output(cwd, args)?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Err(if stderr.is_empty() { stdout } else { stderr })
+        Err(failure_message(&output))
     }
+}
+
+/// Resolve a user-given revision to a full sha, once, so the commands that
+/// follow get an argument that can neither be read as an option nor be
+/// ambiguous with a file of the same name.
+fn resolve_commit(cwd: &Path, rev: &str) -> Result<String, String> {
+    let sha = run_git(
+        cwd,
+        &["rev-parse", "--verify", "--quiet", "--end-of-options", &format!("{rev}^{{commit}}")],
+    )
+    .unwrap_or_default();
+    let sha = sha.trim();
+    if sha.is_empty() {
+        Err(format!("Référence introuvable : {rev}"))
+    } else {
+        Ok(sha.to_string())
+    }
+}
+
+fn tree_of(cwd: &Path, sha: &str) -> Result<String, String> {
+    Ok(run_git(cwd, &["rev-parse", &format!("{sha}^{{tree}}")])?.trim().to_string())
+}
+
+fn list_remotes(cwd: &Path) -> Result<Vec<String>, String> {
+    Ok(run_git(cwd, &["remote"])?
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// The remote the current branch tracks, if it tracks one.
+fn current_branch_remote(cwd: &Path) -> Option<String> {
+    let branch = run_git(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok()?;
+    let remote = run_git(cwd, &["config", "--get", &format!("branch.{}.remote", branch.trim())]).ok()?;
+    let remote = remote.trim();
+    // "." is a branch tracking another LOCAL branch: no remote involved.
+    (!remote.is_empty() && remote != ".").then(|| remote.to_string())
+}
+
+/// Split `origin/feature/x` into remote and branch.
+///
+/// A remote name may itself contain `/` (`team/origin`), so splitting at the
+/// first slash is wrong; the longest known remote that prefixes the ref wins.
+/// Refs of a remote since removed fall back to the first slash.
+fn split_remote_ref<'a>(short: &'a str, remotes: &[String]) -> Option<(&'a str, &'a str)> {
+    remotes
+        .iter()
+        .filter(|r| {
+            short.len() > r.len() + 1
+                && short.starts_with(r.as_str())
+                && short.as_bytes()[r.len()] == b'/'
+        })
+        .max_by_key(|r| r.len())
+        .map(|r| (&short[..r.len()], &short[r.len() + 1..]))
+        .or_else(|| short.split_once('/'))
+}
+
+// ---------------------------------------------------------------------------
+// Network commands
+// ---------------------------------------------------------------------------
+
+/// A remote that accepts the connection and then never answers would leave
+/// the spinner turning forever; past this, the command is killed.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Pull and push also carry local work (a rebase, a pre-push hook).
+const PUSH_PULL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Whether to force ssh into batch mode. A Finder-launched app has no
+/// terminal, so a passphrase or host-key question would wait forever.
+///
+/// Only when the user chose no ssh command of their own: GIT_SSH_COMMAND
+/// takes precedence over core.sshCommand and GIT_SSH, and would silently
+/// drop them.
+fn wants_batch_ssh(cwd: &Path) -> bool {
+    if std::env::var_os("GIT_SSH_COMMAND").is_some() || std::env::var_os("GIT_SSH").is_some() {
+        return false;
+    }
+    !run_git(cwd, &["config", "--get", "core.sshCommand"]).is_ok_and(|v| !v.trim().is_empty())
+}
+
+/// Read a pipe to its end on a thread, so neither stream can fill up and
+/// block git while we wait on the other.
+fn drain(pipe: Option<impl Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// Kill git AND the ssh it spawned: the child leads its own process group.
+fn kill_group(child: &mut Child) {
+    let _ = Command::new("kill")
+        .args(["-KILL", &format!("-{}", child.id())])
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn run_git_network(cwd: &Path, args: &[&str], timeout: Duration) -> Result<Output, String> {
+    let mut cmd = git_command(cwd, args);
+    if wants_batch_ssh(cwd) {
+        cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    let mut child = cmd
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= timeout => {
+                kill_group(&mut child);
+                return Err(format!(
+                    "Délai dépassé ({} s) : le distant ne répond pas",
+                    timeout.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => return Err(format!("failed to wait for git: {e}")),
+        }
+    };
+    // An ssh ControlPersist master inherits the pipes and outlives git: do not
+    // wait on it for the end of the streams.
+    let grace = Duration::from_secs(2);
+    Ok(Output {
+        status,
+        stdout: stdout.recv_timeout(grace).unwrap_or_default(),
+        stderr: stderr.recv_timeout(grace).unwrap_or_default(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -67,7 +249,7 @@ pub struct RepoGroup {
     pub worktrees: Vec<Worktree>,
 }
 
-/// Parsed shape of `git status --porcelain=v2 --branch`.
+/// Parsed shape of `git status --porcelain=v2 --branch -z`.
 struct StatusSummary {
     branch: Option<String>,
     head: Option<String>,
@@ -76,10 +258,12 @@ struct StatusSummary {
     behind: u32,
     dirty: u32,
     staged: u32,
-    untracked: u32,
+    untracked: Vec<String>,
     conflicted: u32,
 }
 
+/// `-z` output: one record per NUL, and a rename record ("2 …") is followed
+/// by one more NUL-terminated field, its source path.
 fn parse_status_v2(raw: &str) -> StatusSummary {
     let mut s = StatusSummary {
         branch: None,
@@ -89,27 +273,28 @@ fn parse_status_v2(raw: &str) -> StatusSummary {
         behind: 0,
         dirty: 0,
         staged: 0,
-        untracked: 0,
+        untracked: Vec::new(),
         conflicted: 0,
     };
 
-    for line in raw.lines() {
-        if let Some(rest) = line.strip_prefix("# branch.head ") {
+    let mut records = raw.split('\0');
+    while let Some(record) = records.next() {
+        if let Some(rest) = record.strip_prefix("# branch.head ") {
             // git writes the literal "(detached)" when HEAD points at no branch.
             s.branch = if rest == "(detached)" {
                 None
             } else {
                 Some(rest.to_string())
             };
-        } else if let Some(rest) = line.strip_prefix("# branch.oid ") {
+        } else if let Some(rest) = record.strip_prefix("# branch.oid ") {
             s.head = if rest == "(initial)" {
                 None
             } else {
                 Some(rest.chars().take(9).collect())
             };
-        } else if let Some(rest) = line.strip_prefix("# branch.upstream ") {
+        } else if let Some(rest) = record.strip_prefix("# branch.upstream ") {
             s.upstream = Some(rest.to_string());
-        } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
+        } else if let Some(rest) = record.strip_prefix("# branch.ab ") {
             for token in rest.split_whitespace() {
                 let value: u32 = token[1..].parse().unwrap_or(0);
                 match token.chars().next() {
@@ -118,7 +303,10 @@ fn parse_status_v2(raw: &str) -> StatusSummary {
                     _ => {}
                 }
             }
-        } else if let Some(rest) = line.strip_prefix("1 ").or_else(|| line.strip_prefix("2 ")) {
+        } else if let Some(rest) = record.strip_prefix("1 ").or_else(|| record.strip_prefix("2 ")) {
+            if record.starts_with('2') {
+                records.next();
+            }
             // "<XY> <sub> ..." — X is the staged status, Y the worktree status.
             let xy: Vec<char> = rest.chars().take(2).collect();
             if xy.first().is_some_and(|c| *c != '.') {
@@ -127,10 +315,10 @@ fn parse_status_v2(raw: &str) -> StatusSummary {
             if xy.get(1).is_some_and(|c| *c != '.') {
                 s.dirty += 1;
             }
-        } else if line.starts_with("u ") {
+        } else if record.starts_with("u ") {
             s.conflicted += 1;
-        } else if line.starts_with("? ") {
-            s.untracked += 1;
+        } else if let Some(path) = record.strip_prefix("? ") {
+            s.untracked.push(path.to_string());
         }
     }
 
@@ -143,28 +331,25 @@ fn dir_name(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().to_string())
 }
 
+fn canonical(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
 /// Read one checkout: its shared git dir (for grouping) and its status.
 fn read_checkout(path: &Path) -> Option<(String, Worktree)> {
-    let common_dir = run_git(path, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .ok()?
-        .trim()
-        .to_string();
-    if common_dir.is_empty() {
-        return None;
-    }
-    let common_dir = std::fs::canonicalize(&common_dir)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or(common_dir);
+    // Both dirs in one spawn, printed in the order asked.
+    let dirs = run_git(path, &["rev-parse", "--path-format=absolute", "--git-common-dir", "--git-dir"]).ok()?;
+    let mut dirs = dirs.lines().map(str::trim);
+    let common_dir = dirs.next().filter(|d| !d.is_empty())?;
+    let own_git_dir = dirs.next().filter(|d| !d.is_empty())?;
+    let common_dir = canonical(common_dir);
+    let own_git_dir = canonical(own_git_dir);
 
-    let own_git_dir = run_git(path, &["rev-parse", "--path-format=absolute", "--git-dir"])
-        .ok()?
-        .trim()
-        .to_string();
-    let own_git_dir = std::fs::canonicalize(&own_git_dir)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or(own_git_dir);
-
-    let status = run_git(path, &["status", "--porcelain=v2", "--branch", "-uall"])
+    // `-uall` on purpose: `-unormal` would count an untracked directory as one
+    // file, and the sidebar number would disagree with the changes panel.
+    let status = run_git(path, &["status", "--porcelain=v2", "--branch", "-z", "-uall"])
         .map(|raw| parse_status_v2(&raw))
         .unwrap_or_else(|_| parse_status_v2(""));
 
@@ -178,7 +363,7 @@ fn read_checkout(path: &Path) -> Option<(String, Worktree)> {
         behind: status.behind,
         dirty_files: status.dirty,
         staged_files: status.staged,
-        untracked_files: status.untracked,
+        untracked_files: status.untracked.len() as u32,
         conflicted_files: status.conflicted,
         // A linked worktree has its own git dir nested under the shared one.
         is_primary: own_git_dir == common_dir,
@@ -221,9 +406,11 @@ fn classify_git_entry(dir: &Path) -> GitEntry {
     if !dot_git.is_file() {
         return GitEntry::None;
     }
-    // Linked worktrees and submodules both use a `gitdir:` pointer file.
+    // Linked worktrees and submodules both use a `gitdir:` pointer file. The
+    // match includes `.git/`: a bare "/modules/" also caught the worktrees of
+    // any repo that merely lives under a directory named `modules`.
     match std::fs::read_to_string(&dot_git) {
-        Ok(content) if content.contains("/modules/") => GitEntry::Submodule,
+        Ok(content) if content.contains("/.git/modules/") => GitEntry::Submodule,
         Ok(_) => GitEntry::Repo,
         Err(_) => GitEntry::None,
     }
@@ -367,7 +554,16 @@ fn parse_track(track: &str) -> (u32, u32, bool) {
     (ahead, behind, false)
 }
 
+/// Parse `%(ahead-behind:<base>)`, "<ahead> <behind>".
+fn parse_ahead_behind(field: &str) -> Option<(u32, u32)> {
+    let mut parts = field.split_whitespace();
+    let ahead = parts.next()?.parse().ok()?;
+    let behind = parts.next()?.parse().ok()?;
+    Some((ahead, behind))
+}
+
 pub fn list_branches(repo: &str) -> Result<Vec<Branch>, String> {
+    let repo_path = Path::new(repo);
     // Unlike `log`/`show`, for-each-ref does NOT expand %xNN escapes (it would
     // emit the literal "%x1f"), so the separator byte is interpolated directly.
     let format = format!(
@@ -377,7 +573,7 @@ pub fn list_branches(repo: &str) -> Result<Vec<Branch>, String> {
     );
 
     let raw = run_git(
-        Path::new(repo),
+        repo_path,
         &[
             "for-each-ref",
             "--sort=-committerdate",
@@ -386,6 +582,7 @@ pub fn list_branches(repo: &str) -> Result<Vec<Branch>, String> {
             "refs/remotes",
         ],
     )?;
+    let remotes = list_remotes(repo_path)?;
 
     let mut branches = Vec::new();
     for line in raw.lines() {
@@ -403,20 +600,20 @@ pub fn list_branches(repo: &str) -> Result<Vec<Branch>, String> {
             continue;
         }
 
+        let (ahead, behind, gone) = parse_track(f[5]);
+        // From the full refname: `refname:short` turns into "remotes/origin/x"
+        // when a local branch is literally named "origin/x".
+        let remote = refname
+            .strip_prefix("refs/remotes/")
+            .and_then(|short| split_remote_ref(short, &remotes))
+            .map(|(remote, _)| remote.to_string());
         let kind = if refname.starts_with("refs/remotes/") {
             "remote"
         } else {
             "local"
         };
-        let (ahead, behind, gone) = parse_track(f[5]);
-        let remote = if kind == "remote" {
-            f[1].split('/').next().map(|s| s.to_string())
-        } else {
-            None
-        };
 
         branches.push(Branch {
-            refname,
             short: f[1].to_string(),
             kind: kind.to_string(),
             sha: f[2].to_string(),
@@ -439,6 +636,7 @@ pub fn list_branches(repo: &str) -> Result<Vec<Branch>, String> {
                 Some(f[10].to_string())
             },
             remote,
+            refname,
         });
     }
 
@@ -469,6 +667,11 @@ pub fn list_commits(
     limit: u32,
     skip: u32,
 ) -> Result<Vec<Commit>, String> {
+    // Revisions come from the UI; one starting with '-' would be an option.
+    if let Some(bad) = revs.iter().find(|r| r.starts_with('-')) {
+        return Err(format!("Révision invalide : {bad}"));
+    }
+
     // `git log` expands %xNN itself; keep the escapes textual.
     let format =
         "--pretty=format:%H%x1f%h%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%D%x1e".to_string();
@@ -486,10 +689,19 @@ pub fn list_commits(
         "--decorate=full".into(),
     ];
     if revs.is_empty() {
-        args.push("--all".into());
+        // Not `--all`: it also walks refs/stash, refs/notes and the like,
+        // whose commits are nobody's history. HEAD keeps a detached checkout
+        // visible; `--ignore-missing` keeps an unborn HEAD from failing.
+        args.extend(
+            ["--ignore-missing", "--branches", "--remotes", "--tags", "HEAD"]
+                .map(String::from),
+        );
     } else {
+        args.push("--end-of-options".into());
         args.extend(revs.iter().cloned());
     }
+    // Revisions only: a branch named like a file is not "ambiguous".
+    args.push("--".into());
 
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let raw = run_git(Path::new(repo), &arg_refs)?;
@@ -551,98 +763,103 @@ pub struct CommitDetail {
     pub files: Vec<ChangedFile>,
 }
 
+/// Parse `--raw --numstat -z` output: the raw section (status letter, rename
+/// source) then the numstat section (counts), both NUL-separated.
+///
+/// `-z` is what makes this reliable. Without it numstat folds a rename into
+/// ONE field (`src/{a => b}/f.rs`, the new path appearing nowhere whole), and
+/// any path with a non-ASCII byte, a tab or a quote comes back C-quoted.
+fn parse_changed_files_z(raw: &str) -> Vec<ChangedFile> {
+    let mut entries: Vec<(String, Option<String>, String)> = Vec::new();
+    let mut counts: HashMap<String, (u32, u32, bool)> = HashMap::new();
+
+    let mut tokens = raw.split('\0');
+    while let Some(token) = tokens.next() {
+        let token = token.trim_start_matches('\n');
+        if token.is_empty() {
+            continue;
+        }
+        if token.starts_with(':') {
+            // ":<mode> <mode> <sha> <sha> <status>", then one path, or two
+            // (source, destination) for a rename or a copy.
+            let status = token.rsplit(' ').next().unwrap_or_default().to_string();
+            let first = tokens.next().unwrap_or_default().to_string();
+            if status.starts_with('R') || status.starts_with('C') {
+                let second = tokens.next().unwrap_or_default().to_string();
+                entries.push((second, Some(first), status));
+            } else {
+                entries.push((first, None, status));
+            }
+        } else {
+            // "<added>\t<deleted>\t<path>", or an empty path followed by the
+            // source and destination of a rename. "-" counts mean binary.
+            let mut parts = token.splitn(3, '\t');
+            let added = parts.next().unwrap_or_default();
+            let deleted = parts.next().unwrap_or_default();
+            let mut path = parts.next().unwrap_or_default().to_string();
+            if path.is_empty() {
+                tokens.next();
+                path = tokens.next().unwrap_or_default().to_string();
+            }
+            let binary = added == "-" || deleted == "-";
+            counts.insert(
+                path,
+                (added.parse().unwrap_or(0), deleted.parse().unwrap_or(0), binary),
+            );
+        }
+    }
+
+    entries
+        .into_iter()
+        .map(|(path, old_path, status)| {
+            let (additions, deletions, binary) = counts.get(&path).copied().unwrap_or((0, 0, false));
+            ChangedFile {
+                path,
+                old_path,
+                status,
+                additions,
+                deletions,
+                binary,
+            }
+        })
+        .collect()
+}
+
+/// Turn a repo-relative path into a pathspec that matches only itself: a
+/// file named `*.rs` or `:(top)x` would otherwise be read as a pattern.
+fn literal_pathspec(path: &str) -> String {
+    format!(":(literal){path}")
+}
+
 pub fn commit_detail(repo: &str, sha: &str) -> Result<CommitDetail, String> {
     let repo_path = Path::new(repo);
     let format =
         "--format=%H%x1f%h%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%cn%x1f%cI%x1f%D%x1f%s%x1f%b";
-    let raw = run_git(repo_path, &["show", "-s", &format, sha])?;
+    let raw = run_git(repo_path, &["show", "-s", format, "--end-of-options", sha, "--"])?;
     let f: Vec<&str> = raw.split(FS).collect();
     if f.len() < 11 {
         return Err(format!("unexpected git show output for {sha}"));
     }
 
-    // numstat gives the counts, name-status the letter (and rename source).
-    let numstat = run_git(
+    // Counts, letters and rename sources in one pass. Kept apart from the
+    // metadata above: the free-text body could hold any separator we chose.
+    let changes = run_git(
         repo_path,
         &[
             "show",
+            "-z",
+            "--raw",
             "--numstat",
             "--format=",
             "-M",
             "-m",
             "--first-parent",
             "--no-color",
-            sha,
+            "--end-of-options",
+            f[0],
+            "--",
         ],
-    )
-    .unwrap_or_default();
-    let name_status = run_git(
-        repo_path,
-        &[
-            "show",
-            "--name-status",
-            "--format=",
-            "-M",
-            "-m",
-            "--first-parent",
-            "--no-color",
-            sha,
-        ],
-    )
-    .unwrap_or_default();
-
-    let mut status_by_path: HashMap<String, (String, Option<String>)> = HashMap::new();
-    for line in name_status.lines() {
-        let mut parts = line.split('\t');
-        let Some(code) = parts.next() else { continue };
-        let code = code.trim();
-        if code.is_empty() {
-            continue;
-        }
-        let first = parts.next().unwrap_or_default().to_string();
-        let second = parts.next().map(|s| s.to_string());
-        match second {
-            // Rename/copy: "<code>\t<old>\t<new>".
-            Some(new_path) => {
-                status_by_path.insert(new_path, (code.to_string(), Some(first)));
-            }
-            None => {
-                status_by_path.insert(first, (code.to_string(), None));
-            }
-        }
-    }
-
-    let mut files = Vec::new();
-    for line in numstat.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let binary = parts[0] == "-" || parts[1] == "-";
-        // A rename shows as "old => new" in numstat's path column; the
-        // name-status map already holds the resolved new path.
-        let path = parts[2..].join("\t");
-        let path = if path.contains(" => ") {
-            parts
-                .last()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| path.clone())
-        } else {
-            path
-        };
-        let (status, old_path) = status_by_path
-            .get(&path)
-            .cloned()
-            .unwrap_or_else(|| ("M".to_string(), None));
-        files.push(ChangedFile {
-            path,
-            old_path,
-            status,
-            additions: parts[0].parse().unwrap_or(0),
-            deletions: parts[1].parse().unwrap_or(0),
-            binary,
-        });
-    }
+    )?;
 
     Ok(CommitDetail {
         sha: f[0].to_string(),
@@ -660,7 +877,7 @@ pub fn commit_detail(repo: &str, sha: &str) -> Result<CommitDetail, String> {
             .collect(),
         subject: f[9].to_string(),
         body: f[10].trim_end().to_string(),
-        files,
+        files: parse_changed_files_z(&changes),
     })
 }
 
@@ -676,9 +893,10 @@ pub fn file_diff(repo: &str, sha: &str, file: &str) -> Result<String, String> {
             "-m",
             "--first-parent",
             "--unified=3",
+            "--end-of-options",
             sha,
             "--",
-            file,
+            &literal_pathspec(file),
         ],
     )
 }
@@ -697,64 +915,6 @@ pub struct WorkingTree {
     pub conflicted_count: u32,
 }
 
-/// Merge numstat counts with name-status letters for a `git diff` invocation.
-fn collect_diff_files(repo: &Path, extra: &[&str]) -> Vec<ChangedFile> {
-    let mut numstat_args = vec!["diff", "--numstat", "-M", "--no-color"];
-    numstat_args.extend_from_slice(extra);
-    let mut status_args = vec!["diff", "--name-status", "-M", "--no-color"];
-    status_args.extend_from_slice(extra);
-
-    let numstat = run_git(repo, &numstat_args).unwrap_or_default();
-    let name_status = run_git(repo, &status_args).unwrap_or_default();
-
-    let mut status_by_path: HashMap<String, (String, Option<String>)> = HashMap::new();
-    for line in name_status.lines() {
-        let mut parts = line.split('\t');
-        let Some(code) = parts.next() else { continue };
-        let code = code.trim();
-        if code.is_empty() {
-            continue;
-        }
-        let first = parts.next().unwrap_or_default().to_string();
-        match parts.next() {
-            Some(new_path) => {
-                status_by_path.insert(new_path.to_string(), (code.to_string(), Some(first)));
-            }
-            None => {
-                status_by_path.insert(first, (code.to_string(), None));
-            }
-        }
-    }
-
-    let mut files = Vec::new();
-    for line in numstat.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let binary = parts[0] == "-" || parts[1] == "-";
-        let path = parts[2..].join("\t");
-        let path = if path.contains(" => ") {
-            parts.last().map(|s| s.to_string()).unwrap_or(path)
-        } else {
-            path
-        };
-        let (status, old_path) = status_by_path
-            .get(&path)
-            .cloned()
-            .unwrap_or_else(|| ("M".to_string(), None));
-        files.push(ChangedFile {
-            path,
-            old_path,
-            status,
-            additions: parts[0].parse().unwrap_or(0),
-            deletions: parts[1].parse().unwrap_or(0),
-            binary,
-        });
-    }
-    files
-}
-
 /// Everything not yet committed: staged, unstaged and untracked, as one list.
 ///
 /// The diff is taken against HEAD so a staged-then-modified file appears once
@@ -764,28 +924,25 @@ fn collect_diff_files(repo: &Path, extra: &[&str]) -> Vec<ChangedFile> {
 pub fn working_tree(repo: &str) -> Result<WorkingTree, String> {
     let repo_path = Path::new(repo);
 
+    // One status pass: the counts, the untracked list, and whether HEAD exists.
+    let status = parse_status_v2(&run_git(
+        repo_path,
+        &["status", "--porcelain=v2", "--branch", "-z", "-uall"],
+    )?);
+
     // A repo with no commit yet has no HEAD to diff against; fall back to the
     // index so a first import still shows its files.
-    let has_head = run_git(repo_path, &["rev-parse", "--verify", "--quiet", "HEAD"])
-        .map(|out| !out.trim().is_empty())
-        .unwrap_or(false);
-
-    let mut files = if has_head {
-        collect_diff_files(repo_path, &["HEAD"])
-    } else {
-        collect_diff_files(repo_path, &["--cached"])
-    };
-
-    let untracked = run_git(
+    let against = if status.head.is_some() { "HEAD" } else { "--cached" };
+    let diff = run_git(
         repo_path,
-        &["ls-files", "--others", "--exclude-standard"],
-    )
-    .unwrap_or_default();
-    let mut untracked_count = 0;
-    for path in untracked.lines().filter(|l| !l.trim().is_empty()) {
-        untracked_count += 1;
+        &["diff", "-z", "--raw", "--numstat", "-M", "--no-color", against, "--"],
+    )?;
+    let mut files = parse_changed_files_z(&diff);
+
+    let untracked_count = status.untracked.len() as u32;
+    for path in status.untracked {
         files.push(ChangedFile {
-            path: path.to_string(),
+            path,
             old_path: None,
             status: "?".to_string(),
             additions: 0,
@@ -793,10 +950,6 @@ pub fn working_tree(repo: &str) -> Result<WorkingTree, String> {
             binary: false,
         });
     }
-
-    let status = run_git(repo_path, &["status", "--porcelain=v2", "--branch", "-uall"])
-        .map(|raw| parse_status_v2(&raw))
-        .unwrap_or_else(|_| parse_status_v2(""));
 
     files.sort_by(|a, b| a.path.cmp(&b.path));
 
@@ -814,29 +967,38 @@ pub fn working_tree(repo: &str) -> Result<WorkingTree, String> {
 pub fn working_tree_diff(repo: &str, file: &str, untracked: bool) -> Result<String, String> {
     let repo_path = Path::new(repo);
     if untracked {
-        // --no-index exits 1 on difference, which run_git reports as an error;
-        // the payload is on stdout, so read it directly.
-        let output = Command::new("git")
-            .args(["diff", "--no-index", "--no-color", "--unified=3", "--", "/dev/null", file])
-            .current_dir(repo_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map_err(|e| format!("failed to spawn git: {e}"))?;
-        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+        // --no-index exits 1 when the files differ, the expected case here,
+        // but ALSO on "Could not access": a 1 without a diff is a failure.
+        // Plain paths, not pathspecs.
+        let output = git_output(
+            repo_path,
+            &["diff", "--no-index", "--no-color", "--unified=3", "--", "/dev/null", file],
+        )?;
+        return match output.status.code() {
+            Some(0) => Ok(String::from_utf8_lossy(&output.stdout).to_string()),
+            Some(1) if !output.stdout.is_empty() => {
+                Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            }
+            _ => Err(failure_message(&output)),
+        };
     }
 
     let has_head = run_git(repo_path, &["rev-parse", "--verify", "--quiet", "HEAD"])
         .map(|out| !out.trim().is_empty())
         .unwrap_or(false);
-    let mut args = vec!["diff", "--no-color", "-M", "--unified=3"];
-    if has_head {
-        args.push("HEAD");
-    } else {
-        args.push("--cached");
-    }
-    args.push("--");
-    args.push(file);
-    run_git(repo_path, &args)
+    let pathspec = literal_pathspec(file);
+    run_git(
+        repo_path,
+        &[
+            "diff",
+            "--no-color",
+            "-M",
+            "--unified=3",
+            if has_head { "HEAD" } else { "--cached" },
+            "--",
+            &pathspec,
+        ],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -863,6 +1025,16 @@ pub struct StaleBranch {
     pub is_head: bool,
 }
 
+fn rev_list_count(cwd: &Path, args: &[&str]) -> Result<u32, String> {
+    let mut full = vec!["rev-list", "--count"];
+    full.extend_from_slice(args);
+    full.push("--");
+    run_git(cwd, &full)?
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| format!("unexpected rev-list output: {e}"))
+}
+
 /// Local branches whose remote counterpart is gone, or that are fully merged.
 ///
 /// Two distinct populations, reported with the reason so the UI never deletes
@@ -872,19 +1044,24 @@ pub struct StaleBranch {
 ///
 /// `unmerged_commits` is the safety number: `git branch -d` refuses a branch
 /// holding unmerged work, and anything above zero here means real commits
-/// would need `-D` to disappear.
+/// would need `-D` to disappear. A count git could not produce is an error,
+/// never a zero: a zero is what makes a branch look safe to delete.
 pub fn stale_branches(repo: &str, base: Option<&str>) -> Result<Vec<StaleBranch>, String> {
     let repo_path = Path::new(repo);
+    let base_sha = base.map(|b| resolve_commit(repo_path, b)).transpose()?;
+    let base_tree = base_sha.as_deref().map(|sha| tree_of(repo_path, sha)).transpose()?;
 
-    // Which branch is HEAD here: never propose deleting it.
-    let head = run_git(repo_path, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-
-    let format = format!(
-        "%(refname:short){FS}%(objectname){FS}%(objectname:short){FS}%(upstream:short){FS}\
-         %(upstream:track){FS}%(committerdate:iso8601-strict){FS}%(contents:subject){FS}%(worktreepath)"
+    // %(HEAD) flags the branch checked out here: never propose deleting it.
+    // %(ahead-behind) (git 2.41) answers `--merged` for every branch in the
+    // same pass: merged means nothing ahead of the base.
+    let mut format = format!(
+        "%(refname){FS}%(refname:short){FS}%(objectname){FS}%(objectname:short){FS}\
+         %(upstream:short){FS}%(upstream:track){FS}%(committerdate:iso8601-strict){FS}\
+         %(contents:subject){FS}%(worktreepath){FS}%(HEAD)"
     );
+    if let Some(sha) = &base_sha {
+        format.push_str(&format!("{FS}%(ahead-behind:{sha})"));
+    }
     let raw = run_git(
         repo_path,
         &[
@@ -895,26 +1072,17 @@ pub fn stale_branches(repo: &str, base: Option<&str>) -> Result<Vec<StaleBranch>
         ],
     )?;
 
-    // Branches fully contained in the base branch, when one was given.
-    let merged: Vec<String> = match base {
-        Some(base) => run_git(repo_path, &["branch", "--format=%(refname:short)", "--merged", base])
-            .map(|out| out.lines().map(|l| l.trim().to_string()).collect())
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
-
-    let mut result = Vec::new();
+    let mut candidates = Vec::new();
     for line in raw.lines() {
         if line.trim().is_empty() {
             continue;
         }
         let f: Vec<&str> = line.split(FS).collect();
-        if f.len() < 8 {
+        if f.len() < 10 {
             continue;
         }
-        let name = f[0].to_string();
-        let (_, _, gone) = parse_track(f[4]);
-        let is_merged = merged.iter().any(|m| m == &name);
+        let (_, _, gone) = parse_track(f[5]);
+        let is_merged = f.get(10).and_then(|ab| parse_ahead_behind(ab)).is_some_and(|(ahead, _)| ahead == 0);
 
         let reason = if gone {
             "gone"
@@ -925,51 +1093,49 @@ pub fn stale_branches(repo: &str, base: Option<&str>) -> Result<Vec<StaleBranch>
         };
 
         // A pinned branch is never a candidate, whatever git says about it.
-        if matches!(name.as_str(), "main" | "master" | "develop" | "dev") {
+        if matches!(f[1], "main" | "master" | "develop" | "dev") {
             continue;
         }
-
-        // How much unique work would be lost. `--not --remotes` also spares a
-        // branch whose commits live on some remote even if this base lacks them.
-        let unmerged = run_git(
-            repo_path,
-            &[
-                "rev-list",
-                "--count",
-                &name,
-                "--not",
-                "--remotes",
-                base.unwrap_or("HEAD"),
-            ],
-        )
-        .ok()
-        .and_then(|out| out.trim().parse::<u32>().ok())
-        .unwrap_or(0);
-
-        // Exact emptiness test, above the commit and patch heuristics.
-        let contributes_nothing = base
-            .and_then(|base| contributes_nothing(repo, base, &name))
-            .unwrap_or(unmerged == 0);
-
-        result.push(StaleBranch {
-            name: name.clone(),
-            contributes_nothing,
-            sha: f[1].to_string(),
-            short_sha: f[2].to_string(),
-            upstream: if f[3].is_empty() { None } else { Some(f[3].to_string()) },
-            date: f[5].to_string(),
-            subject: f[6].to_string(),
-            reason: reason.to_string(),
-            unmerged_commits: unmerged,
-            worktree_path: if f[7].is_empty() { None } else { Some(f[7].to_string()) },
-            is_head: name == head,
-        });
+        candidates.push((f, reason, is_merged));
     }
 
-    Ok(result)
+    candidates
+        .into_par_iter()
+        .map(|(f, reason, is_merged)| {
+            // How much unique work would be lost. `--not --remotes` also spares
+            // a branch whose commits live on some remote even if this base
+            // lacks them. Full refnames: nothing to mistake for a file.
+            let unmerged = rev_list_count(
+                repo_path,
+                &[f[0], "--not", "--remotes", base_sha.as_deref().unwrap_or("HEAD")],
+            )?;
+
+            // Exact emptiness test, above the commit and patch heuristics. A
+            // branch already contained in the base trivially changes nothing.
+            let contributes_nothing = match (&base_sha, &base_tree) {
+                (Some(_), Some(_)) if is_merged => true,
+                (Some(sha), Some(tree)) => merge_is_noop(repo_path, sha, tree, f[0])?,
+                _ => unmerged == 0,
+            };
+
+            Ok(StaleBranch {
+                name: f[1].to_string(),
+                contributes_nothing,
+                sha: f[2].to_string(),
+                short_sha: f[3].to_string(),
+                upstream: if f[4].is_empty() { None } else { Some(f[4].to_string()) },
+                date: f[6].to_string(),
+                subject: f[7].to_string(),
+                reason: reason.to_string(),
+                unmerged_commits: unmerged,
+                worktree_path: if f[8].is_empty() { None } else { Some(f[8].to_string()) },
+                is_head: f[9] == "*",
+            })
+        })
+        .collect()
 }
 
-/// Whether merging `branch` into `base` would change anything at all.
+/// Whether merging `rev` into the base would change anything at all.
 ///
 /// The exact test, and the only one that survives a squashed or rebased merge
 /// request: `git merge-tree --write-tree` computes the tree the merge WOULD
@@ -979,43 +1145,46 @@ pub fn stale_branches(repo: &str, base: Option<&str>) -> Result<Vec<StaleBranch>
 /// Both `--merged` (compares commits) and `git cherry` (compares patch ids)
 /// answer "not merged" for a branch whose patch was touched on the way in —
 /// rebased, squashed, or conflict-resolved — even though every line shipped.
-/// Requires git 2.38+; on older git this reports `None` rather than guessing.
-pub fn contributes_nothing(repo: &str, base: &str, branch: &str) -> Option<bool> {
-    let repo_path = Path::new(repo);
-    let merged_tree = run_git(repo_path, &["merge-tree", "--write-tree", base, branch]).ok()?;
-    let merged_tree = merged_tree.lines().next()?.trim().to_string();
-    if merged_tree.len() < 40 {
-        return None;
+/// Requires git 2.38+. `base_sha` and `rev` must be a sha or a full refname.
+fn merge_is_noop(cwd: &Path, base_sha: &str, base_tree: &str, rev: &str) -> Result<bool, String> {
+    let output = git_output(cwd, &["merge-tree", "--write-tree", base_sha, rev])?;
+    match output.status.code() {
+        Some(0) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Ok(stdout.lines().next().map(str::trim) == Some(base_tree))
+        }
+        // Conflicts: the branch changes lines the base changed differently,
+        // so it does carry something the base lacks.
+        Some(1) => Ok(false),
+        _ => Err(failure_message(&output)),
     }
-    let base_tree = run_git(repo_path, &["rev-parse", &format!("{base}^{{tree}}")]).ok()?;
-    Some(merged_tree == base_tree.trim())
+}
+
+/// (contributes_nothing, unmerged_commits) for one local branch against a
+/// base. Errors propagate: "could not tell" must never read as "safe".
+pub fn branch_contribution(repo: &str, branch: &str, base: &str) -> Result<(bool, u32), String> {
+    let repo_path = Path::new(repo);
+    let base_sha = resolve_commit(repo_path, base)?;
+    let base_tree = tree_of(repo_path, &base_sha)?;
+    let nothing = merge_is_noop(repo_path, &base_sha, &base_tree, &format!("refs/heads/{branch}"))?;
+    Ok((nothing, unmerged_commit_count(repo, branch)?))
 }
 
 /// Commits held by `branch` and by nothing else — no other local branch, no
 /// remote. This is exactly what a forced delete would destroy.
 pub fn unmerged_commit_count(repo: &str, branch: &str) -> Result<u32, String> {
-    let repo_path = Path::new(repo);
-
     // Every local branch except this one, so work merged elsewhere is spared.
-    let others = run_git(repo_path, &["branch", "--format=%(refname:short)"])?;
-    let mut args: Vec<String> = vec![
-        "rev-list".into(),
-        "--count".into(),
-        branch.to_string(),
-        "--not".into(),
-        "--remotes".into(),
-    ];
-    for other in others.lines().map(|l| l.trim()) {
-        if !other.is_empty() && other != branch {
-            args.push(other.to_string());
-        }
-    }
-
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    run_git(repo_path, &arg_refs)?
-        .trim()
-        .parse::<u32>()
-        .map_err(|e| format!("unexpected rev-list output: {e}"))
+    // `--exclude` is a glob, but a branch name cannot hold `*`, `?` or `[`.
+    rev_list_count(
+        Path::new(repo),
+        &[
+            &format!("refs/heads/{branch}"),
+            "--not",
+            "--remotes",
+            &format!("--exclude={branch}"),
+            "--branches",
+        ],
+    )
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1057,21 +1226,24 @@ pub fn remote_branches_state(
     base: &str,
 ) -> Result<Vec<StaleRemoteBranch>, String> {
     let repo_path = Path::new(repo);
+    let base_sha = resolve_commit(repo_path, base)?;
+    let base_tree = tree_of(repo_path, &base_sha)?;
+    let remotes = list_remotes(repo_path)?;
 
-    let merged: Vec<String> = run_git(
+    let locals: HashSet<String> = run_git(
         repo_path,
-        &["branch", "-r", "--format=%(refname:short)", "--merged", base],
-    )
-    .map(|out| out.lines().map(|l| l.trim().to_string()).collect())
-    .unwrap_or_default();
+        &["for-each-ref", "--format=%(refname:lstrip=2)", "refs/heads"],
+    )?
+    .lines()
+    .map(String::from)
+    .collect();
 
-    let locals: Vec<String> = run_git(repo_path, &["branch", "--format=%(refname:short)"])
-        .map(|out| out.lines().map(|l| l.trim().to_string()).collect())
-        .unwrap_or_default();
-
+    // %(ahead-behind) (git 2.41) gives every branch's unique commit count in
+    // this one pass, where a rev-list per branch used to; zero ahead is
+    // exactly what `branch --merged` reports.
     let format = format!(
-        "%(refname:short){FS}%(objectname:short){FS}%(committerdate:iso8601-strict){FS}\
-         %(contents:subject){FS}%(authorname)"
+        "%(refname){FS}%(objectname:short){FS}%(committerdate:iso8601-strict){FS}\
+         %(contents:subject){FS}%(authorname){FS}%(symref){FS}%(ahead-behind:{base_sha})"
     );
     let raw = run_git(
         repo_path,
@@ -1084,61 +1256,64 @@ pub fn remote_branches_state(
     )?;
 
     let protected = ["main", "master", "develop", "dev", "staging", "HEAD"];
-    let mut result = Vec::new();
-
+    let mut candidates = Vec::new();
     for line in raw.lines() {
         if line.trim().is_empty() {
             continue;
         }
         let f: Vec<&str> = line.split(FS).collect();
-        if f.len() < 5 {
+        if f.len() < 7 || !f[5].is_empty() {
             continue;
         }
-        let name = f[0].to_string();
-        let Some((remote, branch)) = name.split_once('/') else {
+        let Some(name) = f[0].strip_prefix("refs/remotes/") else {
+            continue;
+        };
+        let Some((remote, branch)) = split_remote_ref(name, &remotes) else {
             continue;
         };
         if branch.is_empty() || protected.contains(&branch) || name == base {
             continue;
         }
-
-        let unmerged = run_git(repo_path, &["rev-list", "--count", &name, "--not", base])
-            .ok()
-            .and_then(|out| out.trim().parse::<u32>().ok())
-            .unwrap_or(0);
-
-        // `git cherry` marks "+" a commit whose change has no equivalent in the
-        // base, and "-" one already applied there under a different sha.
-        let unapplied = if unmerged == 0 {
-            0
-        } else {
-            run_git(repo_path, &["cherry", base, &name])
-                .map(|out| {
-                    out.lines().filter(|l| l.trim_start().starts_with('+')).count() as u32
-                })
-                .unwrap_or(unmerged)
+        let Some((unmerged, _)) = parse_ahead_behind(f[6]) else {
+            return Err(format!("unexpected ahead-behind output for {name}"));
         };
-
-        let contributes = contributes_nothing(repo, base, &name).unwrap_or(unapplied == 0);
-
-        result.push(StaleRemoteBranch {
-            contributes_nothing: contributes,
-            remote: remote.to_string(),
-            branch: branch.to_string(),
-            merged: merged.iter().any(|m| m == &name),
-            unmerged_commits: unmerged,
-            equivalent_merged: unapplied == 0,
-            unapplied_commits: unapplied,
-            has_local: locals.iter().any(|l| l == branch),
-            short_sha: f[1].to_string(),
-            date: f[2].to_string(),
-            subject: f[3].to_string(),
-            author: f[4].to_string(),
-            name,
-        });
+        candidates.push((f, name, remote, branch, unmerged));
     }
 
-    Ok(result)
+    candidates
+        .into_par_iter()
+        .map(|(f, name, remote, branch, unmerged)| {
+            // `git cherry` marks "+" a commit whose change has no equivalent in
+            // the base, and "-" one already applied there under a different sha.
+            let unapplied = if unmerged == 0 {
+                0
+            } else {
+                run_git(repo_path, &["cherry", &base_sha, f[0]])?
+                    .lines()
+                    .filter(|l| l.trim_start().starts_with('+'))
+                    .count() as u32
+            };
+
+            // A branch already contained in the base trivially changes nothing.
+            let contributes = unmerged == 0 || merge_is_noop(repo_path, &base_sha, &base_tree, f[0])?;
+
+            Ok(StaleRemoteBranch {
+                contributes_nothing: contributes,
+                remote: remote.to_string(),
+                branch: branch.to_string(),
+                merged: unmerged == 0,
+                unmerged_commits: unmerged,
+                equivalent_merged: unapplied == 0,
+                unapplied_commits: unapplied,
+                has_local: locals.contains(branch),
+                short_sha: f[1].to_string(),
+                date: f[2].to_string(),
+                subject: f[3].to_string(),
+                author: f[4].to_string(),
+                name: name.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Delete branches on a remote, one push per branch so one refusal (a
@@ -1148,24 +1323,29 @@ pub fn delete_remote_branches(
     remote: &str,
     branches: &[String],
 ) -> Result<Vec<DeleteOutcome>, String> {
-    let repo_path = Path::new(repo);
-
     Ok(branches
         .iter()
-        .map(
-            |branch| match run_git(repo_path, &["push", remote, "--delete", branch]) {
+        .map(|branch| {
+            // The full refname: a tag of the same name must not be the one deleted.
+            let target = format!("refs/heads/{branch}");
+            let result = network_action(
+                repo,
+                &["push", "--delete", "--end-of-options", remote, &target],
+                PUSH_PULL_TIMEOUT,
+            );
+            match result {
                 Ok(out) => DeleteOutcome {
                     name: branch.clone(),
                     deleted: true,
-                    message: out.trim().to_string(),
+                    message: out.output,
                 },
                 Err(err) => DeleteOutcome {
                     name: branch.clone(),
                     deleted: false,
                     message: err,
                 },
-            },
-        )
+            }
+        })
         .collect())
 }
 
@@ -1191,7 +1371,7 @@ pub fn delete_branches(
 
     Ok(names
         .iter()
-        .map(|name| match run_git(repo_path, &["branch", flag, name]) {
+        .map(|name| match run_git(repo_path, &["branch", flag, "--end-of-options", name]) {
             Ok(out) => DeleteOutcome {
                 name: name.clone(),
                 deleted: true,
@@ -1209,6 +1389,10 @@ pub fn delete_branches(
 // ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
+//
+// Every ref, sha or path coming from the UI sits behind `--end-of-options`:
+// a branch named `--upload-pack=…` must stay a (refused) name, not become an
+// option. Trailing `--` marks it as a revision, never a file.
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -1217,26 +1401,41 @@ pub struct ActionResult {
     pub output: String,
 }
 
-fn action(repo: &str, args: &[&str]) -> Result<ActionResult, String> {
-    match run_git(Path::new(repo), args) {
-        Ok(out) => Ok(ActionResult {
-            ok: true,
-            output: out.trim().to_string(),
-        }),
-        Err(err) => Err(err),
+/// What an action reports. fetch, push and pull write their whole report
+/// ("Everything up-to-date", the updated refs) to stderr, so stdout alone
+/// would read as silence.
+fn action_result(output: Output) -> Result<ActionResult, String> {
+    if !output.status.success() {
+        return Err(failure_message(&output));
     }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let output = if stdout.is_empty() {
+        String::from_utf8_lossy(&output.stderr).trim().to_string()
+    } else {
+        stdout
+    };
+    Ok(ActionResult { ok: true, output })
+}
+
+fn action(repo: &str, args: &[&str]) -> Result<ActionResult, String> {
+    action_result(git_output(Path::new(repo), args)?)
+}
+
+fn network_action(repo: &str, args: &[&str], timeout: Duration) -> Result<ActionResult, String> {
+    action_result(run_git_network(Path::new(repo), args, timeout)?)
 }
 
 pub fn checkout(repo: &str, branch: &str) -> Result<ActionResult, String> {
-    action(repo, &["checkout", branch])
+    action(repo, &["checkout", "--end-of-options", branch, "--"])
 }
 
 pub fn checkout_remote(repo: &str, local: &str, remote_ref: &str) -> Result<ActionResult, String> {
-    action(repo, &["checkout", "-b", local, "--track", remote_ref])
+    // `-b` consumes its value, and git refuses a branch name starting with '-'.
+    action(repo, &["checkout", "--track", "-b", local, "--end-of-options", remote_ref, "--"])
 }
 
 pub fn create_branch(repo: &str, name: &str, start: &str) -> Result<ActionResult, String> {
-    action(repo, &["checkout", "-b", name, start])
+    action(repo, &["checkout", "-b", name, "--end-of-options", start, "--"])
 }
 
 pub fn merge(repo: &str, branch: &str, no_ff: bool) -> Result<ActionResult, String> {
@@ -1244,16 +1443,16 @@ pub fn merge(repo: &str, branch: &str, no_ff: bool) -> Result<ActionResult, Stri
     if no_ff {
         args.push("--no-ff");
     }
-    args.push(branch);
+    args.extend(["--end-of-options", branch]);
     action(repo, &args)
 }
 
 pub fn rebase(repo: &str, onto: &str) -> Result<ActionResult, String> {
-    action(repo, &["rebase", onto])
+    action(repo, &["rebase", "--end-of-options", onto])
 }
 
 pub fn delete_branch(repo: &str, branch: &str, force: bool) -> Result<ActionResult, String> {
-    action(repo, &["branch", if force { "-D" } else { "-d" }, branch])
+    action(repo, &["branch", if force { "-D" } else { "-d" }, "--end-of-options", branch])
 }
 
 /// Remove a linked worktree: drops its registration AND deletes its directory.
@@ -1262,13 +1461,75 @@ pub fn delete_branch(repo: &str, branch: &str, force: bool) -> Result<ActionResu
 /// current directory. git refuses to remove the main worktree, and refuses one
 /// holding uncommitted work unless forced — both are left to git rather than
 /// re-implemented here, so the refusal messages stay authoritative.
+/// Directories a `git worktree remove` of this session left behind, once git
+/// had already dropped their registration (and possibly their `.git` file).
+///
+/// Nothing on disk tells them apart from any other folder by then, so the only
+/// proof they were a worktree is having watched git remove it. Without this,
+/// "no `.git` inside" would be enough to bin an arbitrary directory.
+fn leftover_dirs() -> &'static Mutex<HashSet<PathBuf>> {
+    static DIRS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    DIRS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 pub fn remove_worktree(repo: &str, path: &str, force: bool) -> Result<ActionResult, String> {
     let mut args = vec!["worktree", "remove"];
     if force {
         args.push("--force");
     }
-    args.push(path);
-    action(repo, &args)
+    args.extend(["--end-of-options", path]);
+    let result = action(repo, &args);
+    if let Err(err) = &result {
+        if err.contains("Directory not empty") {
+            if let Ok(dir) = std::fs::canonicalize(path) {
+                leftover_dirs().lock().unwrap().insert(dir);
+            }
+        }
+    }
+    result
+}
+
+/// Whether `target` is a directory this repo's worktrees own, and thus safe
+/// to bin. Anything else is refused: this deletes a whole tree.
+///
+/// Accepted: a registered linked worktree (never the main one); a directory
+/// whose `.git` FILE points into this repo's `worktrees/`; or a directory with
+/// no `.git` at all that a failed `git worktree remove` just left behind (see
+/// `leftover_dirs`) — git drops the registration and may already have deleted
+/// the `.git` file before stopping.
+fn owns_worktree_dir(repo: &Path, target: &Path) -> Result<bool, String> {
+    let target = std::fs::canonicalize(target).map_err(|e| format!("{}: {e}", target.display()))?;
+
+    let listing = run_git(repo, &["worktree", "list", "--porcelain", "-z"])?;
+    let mut paths = listing
+        .split('\0')
+        .filter_map(|record| record.strip_prefix("worktree "))
+        .map(|p| PathBuf::from(canonical(p)));
+    // git lists the main worktree first.
+    let main = paths.next().ok_or("git worktree list est vide")?;
+    if target == main || main.starts_with(&target) {
+        return Ok(false);
+    }
+    if paths.any(|p| p == target) {
+        return Ok(true);
+    }
+
+    let dot_git = target.join(".git");
+    if dot_git.is_file() {
+        let common_dir = run_git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+        let worktrees_dir = PathBuf::from(canonical(common_dir.trim())).join("worktrees");
+        let content = std::fs::read_to_string(&dot_git).unwrap_or_default();
+        let Some(gitdir) = content.trim().strip_prefix("gitdir:") else {
+            return Ok(false);
+        };
+        // The registration itself may be gone already: compare its parent.
+        let gitdir = target.join(gitdir.trim());
+        return Ok(gitdir
+            .parent()
+            .is_some_and(|parent| PathBuf::from(canonical(&parent.to_string_lossy())) == worktrees_dir));
+    }
+
+    Ok(!dot_git.exists() && leftover_dirs().lock().unwrap().contains(&target))
 }
 
 /// Move a leftover worktree directory to the Trash, then prune registrations.
@@ -1284,12 +1545,10 @@ pub fn discard_worktree_directory(repo: &str, path: &str) -> Result<ActionResult
         return prune_worktrees(repo);
     }
     if !target.is_dir() {
-        return Err(format!("{path} is not a directory"));
+        return Err(format!("{path} n'est pas un dossier"));
     }
-    // Refuse anything that is not a checkout directory, in case a caller ever
-    // passes something unexpected: this deletes a whole tree.
-    if target.parent().is_none() || target == Path::new("/") {
-        return Err(format!("refusing to discard {path}"));
+    if target.parent().is_none() || !owns_worktree_dir(Path::new(repo), target)? {
+        return Err(format!("Refusé : {path} n'est pas un worktree de ce dépôt"));
     }
 
     // Finder's own delete puts it in the Trash, recoverable, with no extra
@@ -1326,20 +1585,30 @@ pub fn fetch(repo: &str, prune: bool) -> Result<ActionResult, String> {
     if prune {
         args.push("--prune");
     }
-    action(repo, &args)
+    network_action(repo, &args, FETCH_TIMEOUT)
 }
 
 /// Push the current branch.
 ///
-/// `set_upstream` publishes a branch that has none yet (`push -u origin HEAD`),
-/// which is the case where a plain `git push` fails with a hint instead of
-/// doing the obvious thing.
+/// `set_upstream` publishes a branch that has none yet (`push -u <remote>
+/// HEAD`), which is the case where a plain `git push` fails with a hint
+/// instead of doing the obvious thing. The remote is the branch's configured
+/// one, else the only remote there is, else `origin`.
 pub fn push(repo: &str, set_upstream: bool) -> Result<ActionResult, String> {
-    if set_upstream {
-        action(repo, &["push", "--set-upstream", "origin", "HEAD"])
-    } else {
-        action(repo, &["push"])
+    if !set_upstream {
+        return network_action(repo, &["push"], PUSH_PULL_TIMEOUT);
     }
+    let repo_path = Path::new(repo);
+    let remotes = list_remotes(repo_path)?;
+    let remote = current_branch_remote(repo_path)
+        .filter(|r| remotes.contains(r))
+        .or_else(|| (remotes.len() == 1).then(|| remotes[0].clone()))
+        .unwrap_or_else(|| "origin".to_string());
+    network_action(
+        repo,
+        &["push", "--set-upstream", "--end-of-options", &remote, "HEAD"],
+        PUSH_PULL_TIMEOUT,
+    )
 }
 
 /// When this repo last fetched, as a Unix timestamp in seconds.
@@ -1370,8 +1639,160 @@ pub fn last_fetch(repo: &str) -> Result<Option<u64>, String> {
     }
 }
 
-pub fn pull(repo: &str) -> Result<ActionResult, String> {
-    action(repo, &["pull", "--ff-only"])
+/// How `pull` reconciles a branch that has diverged from its upstream.
+///
+/// `--ff-only` alone dead-ends as soon as there is something to push AND
+/// something to pull: git refuses, and the push is refused too until the pull
+/// happens. Rebase and merge are the two ways out; `--autostash` keeps a dirty
+/// tree from blocking either.
+pub fn pull(repo: &str, mode: &str) -> Result<ActionResult, String> {
+    let args: &[&str] = match mode {
+        "ff-only" => &["pull", "--ff-only"],
+        "merge" => &["pull", "--no-rebase", "--autostash"],
+        "rebase" => &["pull", "--rebase", "--autostash"],
+        other => return Err(format!("unknown pull mode: {other}")),
+    };
+    network_action(repo, args, PUSH_PULL_TIMEOUT)
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchOutcome {
+    pub repo: String,
+    pub ok: bool,
+    pub output: String,
+}
+
+/// fetch_many's own small pool. On rayon's global pool, a dozen fetches
+/// waiting on the network would hold every worker, and the next workspace
+/// scan would queue behind them.
+fn fetch_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .thread_name(|i| format!("gitflo-fetch-{i}"))
+            .build()
+            .expect("failed to build the fetch thread pool")
+    })
+}
+
+/// Fetch several repositories at once, for the background auto-fetch.
+///
+/// Never fails as a whole: one unreachable remote must not hide the others.
+pub fn fetch_many(repos: &[String]) -> Vec<FetchOutcome> {
+    fetch_pool().install(|| {
+        repos
+            .par_iter()
+            .map(|repo| match fetch(repo, true) {
+                Ok(result) => FetchOutcome {
+                    repo: repo.clone(),
+                    ok: true,
+                    output: result.output,
+                },
+                Err(err) => FetchOutcome {
+                    repo: repo.clone(),
+                    ok: false,
+                    output: err,
+                },
+            })
+            .collect()
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Remote web page
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteWeb {
+    /// e.g. `https://github.com/owner/repo`, no trailing slash.
+    pub base: String,
+    /// "github", "gitlab", "bitbucket" or "other".
+    pub kind: String,
+}
+
+/// Web page of a remote. Default remote: the one the current branch tracks,
+/// else `origin`, else the first. None when the URL has no web equivalent.
+pub fn remote_web_url(repo: &str, remote: Option<&str>) -> Result<Option<RemoteWeb>, String> {
+    let repo_path = Path::new(repo);
+    let remote = match remote {
+        Some(remote) => remote.to_string(),
+        None => {
+            let remotes = list_remotes(repo_path)?;
+            let chosen = current_branch_remote(repo_path)
+                .filter(|r| remotes.contains(r))
+                .or_else(|| remotes.iter().find(|r| *r == "origin").cloned())
+                .or_else(|| remotes.first().cloned());
+            match chosen {
+                Some(remote) => remote,
+                None => return Ok(None),
+            }
+        }
+    };
+    let url = run_git(repo_path, &["remote", "get-url", "--end-of-options", &remote])?;
+    Ok(web_base_from_remote_url(url.trim()))
+}
+
+/// Convert a clone URL into the https address of its web page.
+///
+/// Handles scp-like (`git@host:owner/repo.git`), `ssh://`, `git://` and
+/// `http(s)://` URLs, any depth of path (GitLab subgroups). Credentials are
+/// dropped — a token in a clone URL must never end up in a link — and so is
+/// an ssh port, which says nothing about where the web server listens.
+fn web_base_from_remote_url(url: &str) -> Option<RemoteWeb> {
+    let (web_scheme, host, path) = match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let scheme = scheme.to_ascii_lowercase();
+            let web_scheme = match scheme.as_str() {
+                "https" => "https",
+                "http" => "http",
+                "ssh" | "git" | "git+ssh" | "ssh+git" => "https",
+                _ => return None,
+            };
+            let (authority, path) = rest.split_once('/')?;
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            let host = if scheme.starts_with("http") {
+                host
+            } else {
+                match host.rsplit_once(':') {
+                    Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) => h,
+                    _ => host,
+                }
+            };
+            (web_scheme, host, path)
+        }
+        None => {
+            // scp-like: a colon before any slash; anything else is a local path.
+            let (authority, path) = url.split_once(':')?;
+            if authority.contains('/') {
+                return None;
+            }
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            ("https", host, path)
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path).trim_end_matches('/');
+    // owner/repo at the least; a lone segment is no hosted project page.
+    if path.split('/').filter(|s| !s.is_empty()).count() < 2 || path.contains("//") {
+        return None;
+    }
+
+    let lower = host.to_ascii_lowercase();
+    let kind = ["github", "gitlab", "bitbucket"]
+        .into_iter()
+        .find(|k| lower.contains(k))
+        .unwrap_or("other");
+    Some(RemoteWeb {
+        base: format!("{web_scheme}://{host}/{path}"),
+        kind: kind.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -1380,40 +1801,138 @@ mod tests {
 
     #[test]
     fn parses_status_v2_branch_headers() {
-        let raw = "\
-# branch.oid 6454e405aaaa1111bbbb
-# branch.head feature/login
-# branch.upstream origin/feature/login
-# branch.ab +3 -2
-1 .M N... 100644 100644 100644 aaa bbb lib/foo.py
-1 M. N... 100644 100644 100644 aaa bbb lib/bar.py
-1 MM N... 100644 100644 100644 aaa bbb lib/baz.py
-u UU N... 100644 100644 100644 100644 aaa bbb ccc conflicted.py
-? untracked.txt
-";
-        let s = parse_status_v2(raw);
+        let raw = [
+            "# branch.oid 6454e405aaaa1111bbbb",
+            "# branch.head feature/login",
+            "# branch.upstream origin/feature/login",
+            "# branch.ab +3 -2",
+            "1 .M N... 100644 100644 100644 aaa bbb lib/foo.py",
+            "1 M. N... 100644 100644 100644 aaa bbb lib/bar.py",
+            "1 MM N... 100644 100644 100644 aaa bbb lib/baz.py",
+            // A rename carries its source as one more NUL field: not a record.
+            "2 R. N... 100644 100644 100644 aaa bbb R100 lib/new.py",
+            "? looks like a record.py",
+            "u UU N... 100644 100644 100644 100644 aaa bbb ccc conflicted.py",
+            "? untracked.txt",
+            "? caf\u{e9} \"quoted\"\tname.txt",
+            "",
+        ]
+        .join("\0");
+        let s = parse_status_v2(&raw);
         assert_eq!(s.branch.as_deref(), Some("feature/login"));
         assert_eq!(s.head.as_deref(), Some("6454e405a"));
         assert_eq!(s.upstream.as_deref(), Some("origin/feature/login"));
         assert_eq!((s.ahead, s.behind), (3, 2));
-        // baz.py counts in both columns, foo.py only unstaged, bar.py only staged.
+        // baz.py counts in both columns, foo.py only unstaged, bar.py and the
+        // rename only staged.
         assert_eq!(s.dirty, 2);
-        assert_eq!(s.staged, 2);
+        assert_eq!(s.staged, 3);
         assert_eq!(s.conflicted, 1);
-        assert_eq!(s.untracked, 1);
+        assert_eq!(s.untracked, vec!["untracked.txt", "caf\u{e9} \"quoted\"\tname.txt"]);
     }
 
     #[test]
     fn detached_head_yields_no_branch() {
-        let s = parse_status_v2("# branch.oid abc123def\n# branch.head (detached)\n");
+        let s = parse_status_v2("# branch.oid abc123def\0# branch.head (detached)\0");
         assert!(s.branch.is_none());
         assert_eq!(s.head.as_deref(), Some("abc123def"));
     }
 
     #[test]
     fn empty_repo_has_no_head() {
-        let s = parse_status_v2("# branch.oid (initial)\n# branch.head main\n");
+        let s = parse_status_v2("# branch.oid (initial)\0# branch.head main\0");
         assert!(s.head.is_none());
+    }
+
+    #[test]
+    fn parses_renames_and_odd_paths_from_z_output() {
+        // What `git show -z --raw --numstat` prints for a directory rename, a
+        // non-ASCII name, a tab in a name and a binary file.
+        let raw = [
+            ":100644 100644 aaa bbb R079",
+            "src/a/f.rs",
+            "src/b/f.rs",
+            ":100644 100644 ccc ddd M",
+            "caf\u{e9}.txt",
+            ":000000 100644 000 eee A",
+            "tab\tname.txt",
+            ":100644 100644 fff 111 M",
+            "logo.png",
+            "1\t0\t",
+            "src/a/f.rs",
+            "src/b/f.rs",
+            "1\t0\tcaf\u{e9}.txt",
+            "2\t0\ttab\tname.txt",
+            "-\t-\tlogo.png",
+            "",
+        ]
+        .join("\0");
+        let files = parse_changed_files_z(&raw);
+        assert_eq!(files.len(), 4);
+
+        assert_eq!(files[0].path, "src/b/f.rs");
+        assert_eq!(files[0].old_path.as_deref(), Some("src/a/f.rs"));
+        assert_eq!(files[0].status, "R079");
+        assert_eq!((files[0].additions, files[0].deletions), (1, 0));
+
+        assert_eq!(files[1].path, "caf\u{e9}.txt");
+        assert_eq!((files[1].status.as_str(), files[1].additions), ("M", 1));
+
+        assert_eq!(files[2].path, "tab\tname.txt");
+        assert_eq!((files[2].status.as_str(), files[2].additions), ("A", 2));
+
+        assert!(files[3].binary);
+        assert_eq!(files[3].old_path, None);
+    }
+
+    #[test]
+    fn splits_remote_refs_on_the_longest_known_remote() {
+        let remotes = vec!["origin".to_string(), "team/origin".to_string(), "team".to_string()];
+        assert_eq!(split_remote_ref("origin/fix/x", &remotes), Some(("origin", "fix/x")));
+        assert_eq!(split_remote_ref("team/origin/main", &remotes), Some(("team/origin", "main")));
+        assert_eq!(split_remote_ref("team/feature", &remotes), Some(("team", "feature")));
+        // A ref left by a removed remote still splits somewhere sensible.
+        assert_eq!(split_remote_ref("gone/feature", &remotes), Some(("gone", "feature")));
+        // A remote name that is only a prefix of a longer word does not match.
+        assert_eq!(split_remote_ref("origins/x", &remotes), Some(("origins", "x")));
+    }
+
+    #[test]
+    fn parses_ahead_behind() {
+        assert_eq!(parse_ahead_behind("3 0"), Some((3, 0)));
+        assert_eq!(parse_ahead_behind(""), None);
+    }
+
+    #[test]
+    fn converts_remote_urls_to_web_pages() {
+        let web = |url: &str| web_base_from_remote_url(url).map(|w| (w.base, w.kind));
+        let some = |base: &str, kind: &str| Some((base.to_string(), kind.to_string()));
+
+        assert_eq!(web("git@github.com:owner/repo.git"), some("https://github.com/owner/repo", "github"));
+        assert_eq!(web("https://github.com/owner/repo"), some("https://github.com/owner/repo", "github"));
+        assert_eq!(web("https://github.com/owner/repo.git/"), some("https://github.com/owner/repo", "github"));
+        assert_eq!(
+            web("ssh://git@gitlab.example.com:2222/group/sub/repo.git"),
+            some("https://gitlab.example.com/group/sub/repo", "gitlab")
+        );
+        assert_eq!(
+            web("git@gitlab.com:group/sub/repo.git"),
+            some("https://gitlab.com/group/sub/repo", "gitlab")
+        );
+        // Credentials never survive into the link.
+        assert_eq!(
+            web("https://user:s3cret@bitbucket.org/team/repo.git"),
+            some("https://bitbucket.org/team/repo", "bitbucket")
+        );
+        assert_eq!(web("https://jdoe@git.corp.io:8443/a/b"), some("https://git.corp.io:8443/a/b", "other"));
+        assert_eq!(web("http://git.lan/a/b.git"), some("http://git.lan/a/b", "other"));
+        assert_eq!(web("ssh://git@github.com/owner/repo"), some("https://github.com/owner/repo", "github"));
+
+        assert_eq!(web("/Users/me/repos/thing.git"), None);
+        assert_eq!(web("../sibling"), None);
+        assert_eq!(web("file:///srv/repo.git"), None);
+        assert_eq!(web("https://example.com/lonely"), None);
+        assert_eq!(web(""), None);
     }
 
     #[test]
@@ -1423,6 +1942,159 @@ u UU N... 100644 100644 100644 100644 aaa bbb ccc conflicted.py
         assert_eq!(parse_track("[behind 5]"), (0, 5, false));
         assert_eq!(parse_track("[ahead 2, behind 1]"), (2, 1, false));
         assert_eq!(parse_track("[gone]"), (0, 0, true));
+    }
+
+    /// Builds a throwaway repo full of awkward names (a renamed directory, an
+    /// accented file, a glob character, a branch named like a file, a remote
+    /// with a slash) and runs the real commands on it.
+    /// `GITFLO_SCRATCH=/some/dir cargo test scratch_repo -- --ignored`
+    #[test]
+    #[ignore = "writes a scratch repository"]
+    fn scratch_repo_end_to_end() {
+        let root = PathBuf::from(std::env::var("GITFLO_SCRATCH").unwrap_or_else(|_| {
+            std::env::temp_dir().to_string_lossy().to_string()
+        }))
+        .join("gitflo-e2e");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let repo_path = root.join("modules").join("repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        let repo = repo_path.to_str().unwrap();
+        let git = |args: &[&str]| {
+            let mut full = vec!["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"];
+            full.extend_from_slice(args);
+            run_git(&repo_path, &full).unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+        };
+        let write = |name: &str, content: &str| {
+            let path = repo_path.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+
+        git(&["init", "-q", "-b", "main"]);
+        write("src/a/f.rs", "one\ntwo\nthree\nfour\n");
+        write("caf\u{e9}.txt", "x\n");
+        write("a*.txt", "star\n");
+        write("ab.txt", "plain\n");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        git(&["mv", "src/a", "src/b"]);
+        write("src/b/f.rs", "one\ntwo\nthree\nfour\nfive\n");
+        write("caf\u{e9}.txt", "x\ny\n");
+        git(&["commit", "-qam", "rename"]);
+
+        // Renames and non-ASCII names come back whole, and diff by their path.
+        let detail = commit_detail(repo, "HEAD").unwrap();
+        let renamed = detail.files.iter().find(|f| f.status.starts_with('R')).expect("no rename");
+        assert_eq!(renamed.path, "src/b/f.rs");
+        assert_eq!(renamed.old_path.as_deref(), Some("src/a/f.rs"));
+        assert_eq!(renamed.additions, 1);
+        assert!(detail.files.iter().any(|f| f.path == "caf\u{e9}.txt"));
+        for f in &detail.files {
+            assert!(!file_diff(repo, &detail.sha, &f.path).unwrap().is_empty(), "{}", f.path);
+        }
+
+        // A branch named exactly like a file is still just a branch.
+        git(&["branch", "caf\u{e9}.txt", "HEAD~1"]);
+        assert_eq!(list_commits(repo, &["caf\u{e9}.txt".into()], 10, 0).unwrap().len(), 1);
+        assert!(list_commits(repo, &["--all".into()], 10, 0).is_err());
+        assert_eq!(list_commits(repo, &[], 10, 0).unwrap().len(), 2);
+        let (nothing, unique) = branch_contribution(repo, "caf\u{e9}.txt", "main").unwrap();
+        assert!(nothing);
+        assert_eq!(unique, 0);
+        assert!(branch_contribution(repo, "no-such-branch", "main").is_err());
+        let stale = stale_branches(repo, Some("main")).unwrap();
+        assert_eq!(stale.len(), 1);
+        assert!(stale[0].contributes_nothing && stale[0].reason == "merged");
+        checkout(repo, "caf\u{e9}.txt").unwrap();
+        checkout(repo, "main").unwrap();
+        assert!(checkout(repo, "--orphan=x").is_err());
+
+        // A branch with unique work is never reported as contributing nothing.
+        git(&["checkout", "-q", "-b", "feature"]);
+        write("feature.txt", "new\n");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "feature"]);
+        git(&["checkout", "-q", "main"]);
+        assert_eq!(branch_contribution(repo, "feature", "main").unwrap(), (false, 1));
+
+        // Uncommitted: a staged rename, odd names, a glob character.
+        git(&["mv", "ab.txt", "ab-renamed.txt"]);
+        write("a*.txt", "star\nchanged\n");
+        write("caf\u{e9}.txt", "x\ny\nz\n");
+        write("new \"q\"\tfile.txt", "hello\n");
+        let wt = working_tree(repo).unwrap();
+        let paths: Vec<&str> = wt.files.iter().map(|f| f.path.as_str()).collect();
+        println!("{paths:?}");
+        assert!(paths.contains(&"caf\u{e9}.txt"));
+        assert!(paths.contains(&"new \"q\"\tfile.txt"));
+        let moved = wt.files.iter().find(|f| f.path == "ab-renamed.txt").expect("rename");
+        assert_eq!(moved.old_path.as_deref(), Some("ab.txt"));
+        assert_eq!(wt.untracked_count, 1);
+        for f in &wt.files {
+            let diff = working_tree_diff(repo, &f.path, f.status == "?").unwrap();
+            assert!(!diff.is_empty(), "empty diff for {}", f.path);
+        }
+        // `a*.txt` is a literal name, not a pattern also matching others.
+        let star = working_tree_diff(repo, "a*.txt", false).unwrap();
+        assert_eq!(star.matches("diff --git").count(), 1, "{star}");
+        assert!(working_tree_diff(repo, "missing.txt", true).is_err());
+        git(&["reset", "-q", "--hard"]);
+        std::fs::remove_file(repo_path.join("new \"q\"\tfile.txt")).unwrap();
+
+        // A remote whose name holds a slash.
+        let bare = root.join("remote.git");
+        run_git(&root, &["init", "-q", "--bare", bare.to_str().unwrap()]).unwrap();
+        git(&["remote", "add", "team/origin", bare.to_str().unwrap()]);
+        git(&["push", "-q", "team/origin", "main", "feature", "caf\u{e9}.txt"]);
+        fetch(repo, true).unwrap();
+        let branches = list_branches(repo).unwrap();
+        let remote_feature = branches.iter().find(|b| b.refname == "refs/remotes/team/origin/feature").unwrap();
+        assert_eq!(remote_feature.remote.as_deref(), Some("team/origin"));
+        let state = remote_branches_state(repo, "team/origin/main").unwrap();
+        let feature = state.iter().find(|b| b.branch == "feature").unwrap();
+        assert_eq!((feature.remote.as_str(), feature.unmerged_commits, feature.merged), ("team/origin", 1, false));
+        assert!(!feature.contributes_nothing && feature.has_local);
+        let cafe = state.iter().find(|b| b.branch == "caf\u{e9}.txt").unwrap();
+        assert!(cafe.merged && cafe.contributes_nothing);
+        let deleted = delete_remote_branches(repo, "team/origin", &["caf\u{e9}.txt".into()]).unwrap();
+        assert!(deleted[0].deleted, "{}", deleted[0].message);
+
+        // `push -u` picks the only remote there is, not a hardcoded origin.
+        git(&["checkout", "-q", "-b", "publish-me"]);
+        let pushed = push(repo, true).unwrap();
+        assert!(!pushed.output.is_empty(), "push reported nothing");
+        assert_eq!(git(&["config", "branch.publish-me.remote"]).trim(), "team/origin");
+        git(&["checkout", "-q", "main"]);
+
+        git(&["remote", "set-url", "team/origin", "git@github.com:me/thing.git"]);
+        let web = remote_web_url(repo, None).unwrap().unwrap();
+        assert_eq!(web.base, "https://github.com/me/thing");
+
+        // Worktrees: one under a `modules` directory is not a submodule; only
+        // directories this repo's worktrees own may be binned.
+        let linked = root.join("modules").join("linked");
+        git(&["worktree", "add", "-q", linked.to_str().unwrap(), "feature"]);
+        assert!(matches!(classify_git_entry(&linked), GitEntry::Repo));
+        assert!(owns_worktree_dir(&repo_path, &linked).unwrap());
+        assert!(!owns_worktree_dir(&repo_path, &repo_path).unwrap());
+        assert!(!owns_worktree_dir(&repo_path, &root).unwrap());
+        let other = root.join("other");
+        run_git(&root, &["init", "-q", other.to_str().unwrap()]).unwrap();
+        assert!(!owns_worktree_dir(&repo_path, &other).unwrap());
+        // Leftover after the registration is gone, `.git` file still there.
+        std::fs::remove_dir_all(repo_path.join(".git/worktrees/linked")).unwrap();
+        assert!(owns_worktree_dir(&repo_path, &linked).unwrap());
+
+        // A remote that never answers is killed at the deadline, and a
+        // configured core.sshCommand is honoured rather than overridden.
+        git(&["config", "core.sshCommand", "sleep 30 #"]);
+        let started = Instant::now();
+        let err = run_git_network(&repo_path, &["fetch", "ssh://nowhere.invalid/x"], Duration::from_secs(1))
+            .unwrap_err();
+        assert!(err.contains("Délai dépassé"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     /// End-to-end read of a real repo: branches, commits, one detail.

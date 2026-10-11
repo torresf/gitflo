@@ -5,8 +5,8 @@
 mod git;
 
 use git::{
-    ActionResult, Branch, Commit, CommitDetail, DeleteOutcome, RepoGroup, StaleBranch,
-    StaleRemoteBranch, WorkingTree,
+    ActionResult, Branch, Commit, CommitDetail, DeleteOutcome, FetchOutcome, RemoteWeb,
+    RepoGroup, StaleBranch, StaleRemoteBranch, WorkingTree,
 };
 
 #[tauri::command]
@@ -95,15 +95,15 @@ async fn unmerged_commit_count(repo: String, branch: String) -> Result<u32, Stri
 }
 
 /// (contributes_nothing, unmerged_commits) for one branch against a base.
+/// A failure is an error, not `(false, 0)`: that pair reads as "nothing
+/// would be lost" and could green-light a forced delete.
 #[tauri::command]
 async fn branch_contribution(
     repo: String,
     branch: String,
     base: String,
 ) -> Result<(bool, u32), String> {
-    let nothing = git::contributes_nothing(&repo, &base, &branch).unwrap_or(false);
-    let count = git::unmerged_commit_count(&repo, &branch).unwrap_or(0);
-    Ok((nothing, count))
+    git::branch_contribution(&repo, &branch, &base)
 }
 
 #[tauri::command]
@@ -175,8 +175,18 @@ async fn last_fetch(repo: String) -> Result<Option<u64>, String> {
 }
 
 #[tauri::command]
-async fn pull(repo: String) -> Result<ActionResult, String> {
-    git::pull(&repo)
+async fn pull(repo: String, mode: Option<String>) -> Result<ActionResult, String> {
+    git::pull(&repo, mode.as_deref().unwrap_or("ff-only"))
+}
+
+#[tauri::command]
+async fn fetch_many(repos: Vec<String>) -> Vec<FetchOutcome> {
+    git::fetch_many(&repos)
+}
+
+#[tauri::command]
+async fn remote_web_url(repo: String, remote: Option<String>) -> Result<Option<RemoteWeb>, String> {
+    git::remote_web_url(&repo, remote.as_deref())
 }
 
 /// Settings live at a FIXED path, deliberately not derived from the bundle
@@ -216,25 +226,48 @@ async fn write_settings(content: String) -> Result<(), String> {
     std::fs::rename(&tmp, &path).map_err(|e| format!("failed to replace: {e}"))
 }
 
-#[tauri::command]
-fn reveal_in_finder(path: String) -> Result<(), String> {
-    std::process::Command::new("open")
+/// `open` hands off to Launch Services and returns at once, so waiting on it
+/// costs nothing and leaves no zombie child behind, unlike a bare `spawn`.
+fn reveal(path: &str) -> Result<(), String> {
+    let status = std::process::Command::new("open")
         .arg("-R")
-        .arg(&path)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        .arg(path)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Impossible d'afficher {path} dans le Finder"))
+    }
 }
 
 #[tauri::command]
-fn open_in_editor(path: String) -> Result<(), String> {
-    // `cursor` and `code` are the user's editors; fall back to Finder.
-    for bin in ["cursor", "code"] {
-        if std::process::Command::new(bin).arg(&path).spawn().is_ok() {
-            return Ok(());
-        }
+async fn reveal_in_finder(path: String) -> Result<(), String> {
+    reveal(&path)
+}
+
+#[tauri::command]
+async fn open_in_editor(path: String, editor: Option<String>) -> Result<(), String> {
+    // By application name, not the `cursor`/`code` shell commands: an app
+    // launched from the Finder gets a minimal PATH that never holds them.
+    let app = match editor.as_deref().unwrap_or("vscode") {
+        "vscode" => "Visual Studio Code",
+        "cursor" => "Cursor",
+        "zed" => "Zed",
+        other => return Err(format!("éditeur inconnu : {other}")),
+    };
+    // `open -a` exits non-zero when the app is not installed. Said plainly
+    // rather than falling back to something else: the choice is the user's.
+    let opened = std::process::Command::new("open")
+        .args(["-a", app])
+        .arg(&path)
+        .status()
+        .is_ok_and(|s| s.success());
+    if opened {
+        Ok(())
+    } else {
+        Err(format!("{app} est introuvable. Choisis un autre éditeur dans les réglages."))
     }
-    reveal_in_finder(path)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -269,6 +302,8 @@ pub fn run() {
             rebase,
             delete_branch,
             fetch,
+            fetch_many,
+            remote_web_url,
             pull,
             last_fetch,
             push,

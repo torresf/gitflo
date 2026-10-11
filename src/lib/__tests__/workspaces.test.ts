@@ -57,7 +57,9 @@ describe("loadState", () => {
       gutterWidth: null,
       collapsedRepos: [],
       richColors: false,
-      selectedPath: null,
+      autoFetch: true,
+      pullMode: "rebase" as const,
+      editor: "vscode" as const,
     };
     saved.activeId = saved.workspaces[1].id;
     store.setItem(STATE_KEY, JSON.stringify(saved));
@@ -293,31 +295,91 @@ describe("richColors", () => {
   });
 });
 
-describe("selectedPath", () => {
-  it("is null when absent", () => {
-    store.setItem(
-      STATE_KEY,
-      JSON.stringify({ workspaces: [{ id: "a", name: "A", roots: [] }], activeId: "a" }),
-    );
-    expect(loadState(store).selectedPath).toBeNull();
+describe("autoFetch", () => {
+  const stored = (extra: Record<string, unknown>) =>
+    JSON.stringify({
+      workspaces: [{ id: "a", name: "A", roots: [] }],
+      activeId: "a",
+      ...extra,
+    });
+
+  it("defaults to on, including for files written before it existed", () => {
+    store.setItem(STATE_KEY, stored({}));
+    expect(loadState(store).autoFetch).toBe(true);
   });
 
-  it("survives a round-trip", () => {
-    const state = { ...loadState(store, ["/x"]), selectedPath: "/p/api" };
-    store.setItem(STATE_KEY, JSON.stringify(state));
-    expect(loadState(store).selectedPath).toBe("/p/api");
+  it("stays off once turned off", () => {
+    store.setItem(STATE_KEY, stored({ autoFetch: false }));
+    expect(loadState(store).autoFetch).toBe(false);
+  });
+});
+
+describe("pullMode", () => {
+  const stored = (pullMode: unknown) =>
+    JSON.stringify({
+      workspaces: [{ id: "a", name: "A", roots: [] }],
+      activeId: "a",
+      pullMode,
+    });
+
+  it("defaults to rebase, which gets through a diverged branch", () => {
+    store.setItem(STATE_KEY, stored(undefined));
+    expect(loadState(store).pullMode).toBe("rebase");
+  });
+
+  it("keeps a known mode and rejects anything else", () => {
+    store.setItem(STATE_KEY, stored("ff-only"));
+    expect(loadState(store).pullMode).toBe("ff-only");
+    store.setItem(STATE_KEY, stored("merge"));
+    expect(loadState(store).pullMode).toBe("merge");
+    store.setItem(STATE_KEY, stored("squash"));
+    expect(loadState(store).pullMode).toBe("rebase");
+  });
+});
+
+describe("selectedPath (per tab)", () => {
+  const tabs = (extra: Record<string, unknown> = {}, b: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      workspaces: [
+        { id: "a", name: "A", roots: [] },
+        { id: "b", name: "B", roots: [], ...b },
+      ],
+      activeId: "b",
+      ...extra,
+    });
+
+  it("is null when absent", () => {
+    store.setItem(STATE_KEY, tabs());
+    expect(loadState(store).workspaces.map((w) => w.selectedPath)).toEqual([null, null]);
+  });
+
+  it("keeps each tab's own path", () => {
+    store.setItem(STATE_KEY, tabs({}, { selectedPath: "/p/api" }));
+    expect(loadState(store).workspaces.map((w) => w.selectedPath)).toEqual([null, "/p/api"]);
+  });
+
+  it("moves the old global path to the tab that was active", () => {
+    store.setItem(STATE_KEY, tabs({ selectedPath: "/p/web" }));
+    expect(loadState(store).workspaces.map((w) => w.selectedPath)).toEqual([null, "/p/web"]);
   });
 
   it("ignores a non-string value", () => {
-    store.setItem(
-      STATE_KEY,
-      JSON.stringify({
-        workspaces: [{ id: "a", name: "A", roots: [] }],
-        activeId: "a",
-        selectedPath: 42,
-      }),
-    );
-    expect(loadState(store).selectedPath).toBeNull();
+    store.setItem(STATE_KEY, tabs({}, { selectedPath: 42 }));
+    expect(loadState(store).workspaces[1].selectedPath).toBeNull();
+  });
+});
+
+describe("editor", () => {
+  const stored = (editor: unknown) =>
+    JSON.stringify({ workspaces: [{ id: "a", name: "A", roots: [] }], activeId: "a", editor });
+
+  it("defaults to VS Code and rejects unknown values", () => {
+    store.setItem(STATE_KEY, stored(undefined));
+    expect(loadState(store).editor).toBe("vscode");
+    store.setItem(STATE_KEY, stored("cursor"));
+    expect(loadState(store).editor).toBe("cursor");
+    store.setItem(STATE_KEY, stored("emacs"));
+    expect(loadState(store).editor).toBe("vscode");
   });
 });
 

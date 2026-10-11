@@ -6,7 +6,7 @@ import {
   ChevronDown,
   ChevronRight,
   Cloud,
-  GitBranch,
+  Laptop,
   Layers,
   Search,
   Unlink,
@@ -18,17 +18,29 @@ import { ROLE_TEXT_CLASS } from "../lib/laneColors";
 import { showContextMenu } from "../lib/menu";
 import { tip } from "../lib/tooltip";
 import { branchTip } from "../lib/tips";
+import { publishedName } from "../lib/webUrl";
+
+/** "Open on GitHub" for branches the server has; null without a web remote. */
+export interface BranchWebLink {
+  label: string;
+  open: (branch: Branch) => void;
+}
 
 interface Props {
   branches: Branch[];
-  selectedRef: string | null;
+  /** Commit selected in the graph: rows pointing at it are highlighted. */
+  selectedSha: string | null;
   currentBranch: string | null;
   worktreePath: string | null;
-  onSelect: (branch: Branch | null) => void;
+  /** Jump to the branch's tip commit. Filtering lives in the graph toolbar. */
+  onSelect: (branch: Branch) => void;
   onAction: (action: BranchAction, branch: Branch) => void;
   onPrune: () => void;
   /** An analysis is already running: show it on the button. */
   pruneBusy: boolean;
+  /** The list is being read for a repo just opened. */
+  loading: boolean;
+  webLink: BranchWebLink | null;
 }
 
 export type BranchAction =
@@ -93,6 +105,7 @@ function BranchRow({
   displayName,
   onSelect,
   onAction,
+  webLink,
 }: {
   branch: Branch;
   selected: boolean;
@@ -101,6 +114,7 @@ function BranchRow({
   displayName: string;
   onSelect: () => void;
   onAction: (action: BranchAction, branch: Branch) => void;
+  webLink: BranchWebLink | null;
 }) {
   const isRemote = branch.kind === "remote";
   // git refuses to check out a branch already held by another worktree.
@@ -149,6 +163,15 @@ function BranchRow({
         text: "Copier le nom",
         action: () => navigator.clipboard.writeText(branch.short),
       },
+      ...(webLink
+        ? [
+            {
+              text: publishedName(branch) ? webLink.label : `${webLink.label} (non publiée)`,
+              enabled: !!publishedName(branch),
+              action: () => webLink.open(branch),
+            },
+          ]
+        : []),
       {
         text: "Supprimer la branche",
         enabled: !isRemote && !isCurrent && !heldElsewhere,
@@ -174,12 +197,13 @@ function BranchRow({
           : "text-ink-300 hover:bg-ink-800 hover:text-ink-100"
       }`}
     >
-      {/* Same colour language as the graph lanes: trunk green, integration
-          blue, checked-out branch orange, anything else neutral. */}
+      {/* Same glyphs as the graph badges (laptop here, cloud on the remote)
+          and the same colour language as the lanes: trunk green, integration
+          blue, anything else neutral. */}
       {isRemote ? (
         <Cloud size={12} className={`shrink-0 ${roleClass}`} />
       ) : (
-        <GitBranch size={12} className={`shrink-0 ${roleClass}`} />
+        <Laptop size={12} className={`shrink-0 ${roleClass}`} />
       )}
 
       <span
@@ -243,11 +267,12 @@ function Section({
   label: string;
   branches: Branch[];
   strip: boolean;
-  selectedRef: string | null;
+  selectedSha: string | null;
   currentBranch: string | null;
   worktreePath: string | null;
   onSelect: (b: Branch) => void;
   onAction: (action: BranchAction, branch: Branch) => void;
+  webLink: BranchWebLink | null;
 }) {
   const [folded, setFolded] = useState<Record<string, boolean>>({});
   const groups = useMemo(() => groupByPrefix(branches, strip), [branches, strip]);
@@ -269,11 +294,12 @@ function Section({
               key={branch.refname}
               branch={branch}
               displayName={naked(branch)}
-              selected={rowProps.selectedRef === branch.refname}
+              selected={rowProps.selectedSha === branch.sha}
               currentBranch={rowProps.currentBranch}
               worktreePath={rowProps.worktreePath}
               onSelect={() => rowProps.onSelect(branch)}
               onAction={rowProps.onAction}
+              webLink={rowProps.webLink}
             />
           ));
         }
@@ -298,11 +324,12 @@ function Section({
                     key={branch.refname}
                     branch={branch}
                     displayName={naked(branch).slice(prefix.length + 1)}
-                    selected={rowProps.selectedRef === branch.refname}
+                    selected={rowProps.selectedSha === branch.sha}
                     currentBranch={rowProps.currentBranch}
                     worktreePath={rowProps.worktreePath}
-                          onSelect={() => rowProps.onSelect(branch)}
+                    onSelect={() => rowProps.onSelect(branch)}
                     onAction={rowProps.onAction}
+                    webLink={rowProps.webLink}
                   />
                 ))}
               </div>
@@ -316,13 +343,15 @@ function Section({
 
 export function BranchList({
   branches,
-  selectedRef,
+  selectedSha,
   currentBranch,
   worktreePath,
   onSelect,
   onAction,
   onPrune,
   pruneBusy,
+  loading,
+  webLink,
 }: Props) {
   const [query, setQuery] = useState("");
 
@@ -337,11 +366,12 @@ export function BranchList({
   const remoteNames = [...new Set(remotes.map((b) => b.remote ?? "origin"))].sort();
 
   const shared = {
-    selectedRef,
+    selectedSha,
     currentBranch,
     worktreePath,
     onSelect,
     onAction,
+    webLink,
   };
 
   return (
@@ -370,18 +400,14 @@ export function BranchList({
             <Trash2 size={12} />
           )}
         </button>
-        {selectedRef && (
-          <button
-            onClick={() => onSelect(null)}
-            {...tip("Voir toutes les branches")}
-            className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-ink-400 hover:bg-ink-700 hover:text-ink-100"
-          >
-            tout
-          </button>
-        )}
       </header>
 
       <div className="flex-1 overflow-y-auto p-1">
+        {loading && (
+          <p className="flex items-center gap-1.5 px-2 py-2 text-ink-500">
+            <Loader2 size={11} className="animate-spin" /> Lecture des branches…
+          </p>
+        )}
         <Section label="Locales" branches={locals} strip={false} {...shared} />
         {remoteNames.map((remote) => (
           <Section

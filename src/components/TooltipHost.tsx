@@ -62,7 +62,9 @@ export function TooltipHost() {
             {content.badges.map((badge, i) => (
               <span
                 key={`${badge.label}-${i}`}
-                className={`rounded border px-1.5 py-[1px] font-mono text-[10px] leading-tight ${
+                // A monospace space is a full glyph wide: "branche courante"
+                // read as two separate words. Pulled in to a normal gap.
+                className={`rounded border px-1.5 py-[1px] font-mono text-[10px] leading-tight [word-spacing:-0.3em] ${
                   TONE_BADGE[badge.tone ?? "default"]
                 }`}
               >

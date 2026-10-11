@@ -116,8 +116,12 @@ export function CommitDetailPanel({
   onClose,
 }: Props) {
   const [activeFile, setActiveFile] = useState<string | null>(null);
-  const [diff, setDiff] = useState<string>("");
-  const [diffLoading, setDiffLoading] = useState(false);
+  /**
+   * The diff and the file it belongs to. A refresh keeps showing the current
+   * diff until the new one lands (no flash on every window focus), while a
+   * different file shows the loader rather than the previous file's diff.
+   */
+  const [diff, setDiff] = useState<{ file: string; text: string } | null>(null);
 
   const files = wipTree ? wipTree.files : (detail?.files ?? []);
   // Identity of what the panel currently shows, used to reset the open file.
@@ -125,14 +129,13 @@ export function CommitDetailPanel({
 
   useEffect(() => {
     setActiveFile(null);
-    setDiff("");
+    setDiff(null);
   }, [subject]);
 
   useEffect(() => {
     if (!activeFile) return;
     if (!wipTree && !detail) return;
     let cancelled = false;
-    setDiffLoading(true);
 
     const untracked =
       files.find((f) => f.path === activeFile)?.status === "?";
@@ -141,13 +144,23 @@ export function CommitDetailPanel({
       : api.fileDiff(repo, detail!.sha, activeFile);
 
     request
-      .then((d) => !cancelled && setDiff(d))
-      .catch((e) => !cancelled && setDiff(String(e)))
-      .finally(() => !cancelled && setDiffLoading(false));
+      .then((d) => !cancelled && setDiff({ file: activeFile, text: d }))
+      .catch((e) => !cancelled && setDiff({ file: activeFile, text: String(e) }));
     return () => {
       cancelled = true;
     };
-  }, [repo, subject, activeFile]);
+    // `wipTree` too: a refresh (window focus, ⌘R) brings a new tree, and the
+    // open file's diff must follow the edits made meanwhile.
+  }, [repo, subject, activeFile, wipTree]);
+
+  // The open file was committed or reverted meanwhile: close it rather than
+  // showing a diff of nothing.
+  useEffect(() => {
+    if (wipTree && activeFile && !wipTree.files.some((f) => f.path === activeFile)) {
+      setActiveFile(null);
+      setDiff(null);
+    }
+  }, [wipTree, activeFile]);
 
   if (!wipTree && !detail) {
     return (
@@ -257,10 +270,10 @@ export function CommitDetailPanel({
               Clique un fichier pour voir son diff.
             </p>
           )}
-          {activeFile && diffLoading && (
+          {activeFile && diff?.file !== activeFile && (
             <p className="p-3 text-[11px] text-ink-500">Chargement du diff…</p>
           )}
-          {activeFile && !diffLoading && <DiffView diff={diff} />}
+          {activeFile && diff?.file === activeFile && <DiffView diff={diff.text} />}
         </div>
       </div>
     </div>

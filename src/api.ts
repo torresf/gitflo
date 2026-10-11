@@ -6,8 +6,12 @@ import type {
   CommitDetail,
   RepoGroup,
   DeleteOutcome,
+  Editor,
+  FetchOutcome,
+  PullMode,
   RemoteBranchState,
   StaleBranch,
+  WebRemote,
   WorkingTree,
 } from "./types";
 
@@ -81,10 +85,18 @@ export const api = {
   fetch: (repo: string, prune = true) =>
     invoke<ActionResult>("fetch", { repo, prune }),
 
-  pull: (repo: string) => invoke<ActionResult>("pull", { repo }),
+  pull: (repo: string, mode: PullMode) =>
+    invoke<ActionResult>("pull", { repo, mode }),
+
+  /** Background fetch of several repos; per-repo outcomes, never throws as a whole. */
+  fetchMany: (repos: string[]) => invoke<FetchOutcome[]>("fetch_many", { repos }),
 
   push: (repo: string, setUpstream: boolean) =>
     invoke<ActionResult>("push", { repo, setUpstream }),
+
+  /** Web URL of the repo's remote (upstream's remote, else origin), or null. */
+  remoteWebUrl: (repo: string, remote?: string) =>
+    invoke<WebRemote | null>("remote_web_url", { repo, remote: remote ?? null }),
 
   /** Unix seconds of the last fetch, or null before the first one. */
   lastFetch: (repo: string) => invoke<number | null>("last_fetch", { repo }),
@@ -96,5 +108,6 @@ export const api = {
 
   revealInFinder: (path: string) => invoke<void>("reveal_in_finder", { path }),
 
-  openInEditor: (path: string) => invoke<void>("open_in_editor", { path }),
+  openInEditor: (path: string, editor: Editor) =>
+    invoke<void>("open_in_editor", { path, editor }),
 };

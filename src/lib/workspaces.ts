@@ -1,3 +1,5 @@
+import type { Editor, PullMode } from "../types";
+
 export interface Workspace {
   id: string;
   name: string;
@@ -8,6 +10,12 @@ export interface Workspace {
    * a repo id always points inside a `.git` directory.
    */
   hidden: string[];
+  /**
+   * Worktree last opened in this tab, reopened when coming back to it (or on
+   * launch). Per tab: each tab is its own context, and switching back to one
+   * should land where you left it.
+   */
+  selectedPath: string | null;
 }
 
 export interface WorkspaceState {
@@ -33,9 +41,26 @@ export interface WorkspaceState {
    * a wall of hues can drown them.
    */
   richColors: boolean;
-  /** Path of the worktree to reopen on launch. */
-  selectedPath: string | null;
+  /**
+   * Fetch the open tab's repos in the background, and whenever the window
+   * comes back to the front, so ahead/behind are current without asking.
+   */
+  autoFetch: boolean;
+  /** What the main Pull button runs; the others stay one click away. */
+  pullMode: PullMode;
+  /** App "Ouvrir dans l'éditeur" launches. */
+  editor: Editor;
 }
+
+export const PULL_MODES: readonly PullMode[] = ["rebase", "merge", "ff-only"];
+
+export const EDITORS: readonly Editor[] = ["vscode", "cursor", "zed"];
+
+const parseEditor = (value: unknown): Editor =>
+  EDITORS.includes(value as Editor) ? (value as Editor) : "vscode";
+
+const parsePullMode = (value: unknown): PullMode =>
+  PULL_MODES.includes(value as PullMode) ? (value as PullMode) : "rebase";
 
 export const MIN_GUTTER_WIDTH = 24;
 export const MAX_GUTTER_WIDTH = 640;
@@ -73,7 +98,7 @@ export function nameFromPath(path: string): string {
 }
 
 export function createWorkspace(name: string, roots: string[] = []): Workspace {
-  return { id: newId(), name, roots, hidden: [] };
+  return { id: newId(), name, roots, hidden: [], selectedPath: null };
 }
 
 function isWorkspace(value: unknown): value is Workspace {
@@ -87,13 +112,14 @@ function isWorkspace(value: unknown): value is Workspace {
   );
 }
 
-/** `hidden` postdates the first releases, so it may be missing on disk. */
+/** `hidden` and `selectedPath` postdate the first releases: maybe missing. */
 function normalize(workspace: Workspace): Workspace {
   return {
     ...workspace,
     hidden: Array.isArray(workspace.hidden)
       ? workspace.hidden.filter((h) => typeof h === "string")
       : [],
+    selectedPath: typeof workspace.selectedPath === "string" ? workspace.selectedPath : null,
   };
 }
 
@@ -116,12 +142,20 @@ export function parseState(raw: string | null | undefined): WorkspaceState | nul
       : [];
     if (workspaces.length === 0) return null;
 
-    const normalized = workspaces.map(normalize);
+    let normalized = workspaces.map(normalize);
     const activeId =
       typeof candidate.activeId === "string" &&
       normalized.some((w) => w.id === candidate.activeId)
         ? candidate.activeId
         : normalized[0].id;
+    // Files from before per-tab memory kept one global path: it belonged to
+    // the tab that was active.
+    if (typeof candidate.selectedPath === "string") {
+      const legacy = candidate.selectedPath;
+      normalized = normalized.map((w) =>
+        w.id === activeId && w.selectedPath === null ? { ...w, selectedPath: legacy } : w,
+      );
+    }
     return {
       workspaces: normalized,
       activeId,
@@ -130,8 +164,10 @@ export function parseState(raw: string | null | undefined): WorkspaceState | nul
         ? candidate.collapsedRepos.filter((id): id is string => typeof id === "string")
         : [],
       richColors: candidate.richColors === true,
-      selectedPath:
-        typeof candidate.selectedPath === "string" ? candidate.selectedPath : null,
+      // On unless explicitly turned off: absent from files written before it.
+      autoFetch: candidate.autoFetch !== false,
+      pullMode: parsePullMode(candidate.pullMode),
+      editor: parseEditor(candidate.editor),
     };
   } catch {
     return null;
@@ -146,7 +182,9 @@ export function freshState(fallbackRoots: string[] = []): WorkspaceState {
     gutterWidth: null,
     collapsedRepos: [],
     richColors: false,
-    selectedPath: null,
+    autoFetch: true,
+    pullMode: "rebase",
+    editor: "vscode",
   };
 }
 

@@ -44,6 +44,18 @@ tooltip never appears on a moving pointer.
 **A NUL separator cannot travel in an `exec` argument.** `git log` records are
 separated by `%x1e` (ASCII RS), not `%x00`.
 
+**Paths are read with `-z` output** (status, diff, show). Without it numstat folds
+a rename into one field (`src/{a => b}/f.rs`) and any non-ASCII, tab or quote
+in a name comes back C-quoted. Paths sent back go through `:(literal)` so a
+file named `a*.txt` is not a pattern.
+
+**`--end-of-options` goes after the pseudo-options.** Everything past it is a
+revision, `--not` and `--remotes` included. Refs from the UI sit behind it, and
+a trailing `--` keeps a branch named like a file from being "ambiguous".
+
+**`git diff --no-index` exits 1 both on "files differ" and on "could not
+access"**: only a 1 WITH a diff is a success.
+
 **`git for-each-ref` does NOT expand `%xNN`** (unlike `log` and `show`): the
 separator byte is interpolated directly there.
 
@@ -60,7 +72,25 @@ between `tauri dev` and an installed app: settings therefore live in a file at a
 fixed path.
 
 **An element mounted only during a load shifts its neighbours.** Spinners have
-reserved slots.
+reserved slots, and so does anything that comes and goes next to a button (the
+branch picker's clear cross, the old "tout" button that pushed the bin aside).
+
+**Every async read checks, on landing, that it still applies.** Results are
+applied only if the repo (`repoPathRef`), the tab (scan sequence) and the
+request (per-list sequence) are still current. Without it, a slow `git log`
+of repo A landed under repo B, and B's checkout picker listed A's branches.
+Switching repo clears every per-repo list at once for the same reason.
+
+**Every git write goes through `GitLock`** (`src/lib/gitLock.ts`): one at a
+time, its path bound at click time, and the background fetch yields to it. Two
+writes at once collided on `index.lock` and made the busy indicator lie.
+
+**git runs with `LC_ALL=C`.** The front recognises refusals by their English
+text; a translated git (Homebrew's) would defeat that silently.
+
+**`git pull --ff-only` dead-ends on a diverged branch**, and the push is
+refused too until the pull happens: both buttons failed at once. The default
+pull is `--rebase --autostash`; the variants sit behind the chevron.
 
 ## What the graph does (`src/lib/graph.ts`)
 
@@ -92,7 +122,6 @@ preview. A repository cannot have an avatar of its own.
 
 ## Open leads (contributions welcome)
 
-- **Fetch every repository** in one action (the per-repository command exists).
 - **`git worktree prune`** is exposed on the Rust side but not wired to the UI.
 - **Creating a worktree** from the app (only removal exists).
 - **Virtualising the commit list** — 400 rows are fine, 5,000 are not.

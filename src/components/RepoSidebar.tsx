@@ -30,6 +30,9 @@ interface Props {
   onUnhide: (key: string) => void;
   onUnhideAll: () => void;
   onRemoveWorktree: (repo: RepoGroup, worktree: Worktree) => void;
+  /** Menu label of the chosen editor, e.g. "Ouvrir dans VS Code". */
+  editorLabel: string;
+  onOpenInEditor: (path: string) => void;
 }
 
 /** Compact dirty/ahead/behind summary shown on the right of each row. */
@@ -69,6 +72,8 @@ function WorktreeRow({
   onSelect,
   onHide,
   onRemoveWorktree,
+  editorLabel,
+  onOpenInEditor,
   trailing,
 }: {
   wt: Worktree;
@@ -78,12 +83,14 @@ function WorktreeRow({
   onSelect: () => void;
   onHide: (key: string) => void;
   onRemoveWorktree: (repo: RepoGroup, worktree: Worktree) => void;
+  editorLabel: string;
+  onOpenInEditor: (path: string) => void;
   trailing?: React.ReactNode;
 }) {
   const onContext = (e: React.MouseEvent) => {
     e.preventDefault();
     showContextMenu([
-      { text: "Ouvrir dans l'éditeur", action: () => api.openInEditor(wt.path) },
+      { text: editorLabel, action: () => onOpenInEditor(wt.path) },
       { text: "Révéler dans le Finder", action: () => api.revealInFinder(wt.path) },
       { separator: true },
       {
@@ -159,6 +166,8 @@ export function RepoSidebar({
   onUnhide,
   onUnhideAll,
   onRemoveWorktree,
+  editorLabel,
+  onOpenInEditor,
 }: Props) {
   const collapsed = useMemo(() => new Set(collapsedRepos), [collapsedRepos]);
 
@@ -236,6 +245,8 @@ export function RepoSidebar({
                     onSelect={() => onSelect(repo, primary)}
                     onHide={onHide}
                     onRemoveWorktree={onRemoveWorktree}
+                    editorLabel={editorLabel}
+                    onOpenInEditor={onOpenInEditor}
                     trailing={
                       multi ? (
                         <span
@@ -275,6 +286,8 @@ export function RepoSidebar({
                       onSelect={() => onSelect(repo, wt)}
                       onHide={onHide}
                       onRemoveWorktree={onRemoveWorktree}
+                      editorLabel={editorLabel}
+                      onOpenInEditor={onOpenInEditor}
                     />
                   ))}
                 </div>

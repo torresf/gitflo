@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { memo, useEffect, useMemo, useRef } from "react";
 import { Cloud, Laptop, PencilLine, Tag } from "lucide-react";
 import type { Commit } from "../types";
 import { groupRefs, type RefBadgeModel } from "../lib/refs";
@@ -57,6 +57,10 @@ interface Props {
   /** Bare name of the checked-out branch, to know which badge is current. */
   currentBranch: string | null;
   loading: boolean;
+  /** The history was cut at the load limit: say so under the last row. */
+  truncated: boolean;
+  /** "Open on GitHub"-style entry for the commit menu, when the remote has one. */
+  webLink: { label: string; open: (sha: string) => void } | null;
 }
 
 /** Filled tone for the checked-out branch: it should read as "you are here". */
@@ -189,7 +193,12 @@ function wipLabel(wip: WipSummary): string {
   return parts.join(" · ");
 }
 
-export function CommitGraph({
+/**
+ * Memoised: the app re-renders on things the graph does not show (dragging
+ * the detail panel's edge, a toast, the busy label), and redrawing 400 rows on
+ * each mouse move of a drag is what made it stutter.
+ */
+export const CommitGraph = memo(function CommitGraph({
   commits,
   priorityShas,
   selectedSha,
@@ -205,6 +214,8 @@ export function CommitGraph({
   onBadgeAction,
   currentBranch,
   loading,
+  truncated,
+  webLink,
 }: Props) {
   const { rows, laneCount, pinnedLanes } = useMemo(
     () => buildGraph(commits, priorityShas),
@@ -271,6 +282,26 @@ export function CommitGraph({
     };
   }, [onGutterWidthChange]);
 
+  // Selecting from outside (a branch in the list) can land on a row scrolled
+  // out of sight; "nearest" leaves a row already on screen where it is.
+  //
+  // Once per selection: the row may only appear when the history lands, but a
+  // later refresh (which rebuilds the rows) must not yank the view back to it
+  // after the user has scrolled away.
+  const scroller = useRef<HTMLDivElement>(null);
+  const pendingScroll = useRef<string | null>(null);
+  useEffect(() => {
+    pendingScroll.current = selectedSha;
+  }, [selectedSha]);
+  useEffect(() => {
+    const sha = pendingScroll.current;
+    if (!sha) return;
+    const row = scroller.current?.querySelector(`[data-sha="${sha}"]`);
+    if (!row) return;
+    row.scrollIntoView({ block: "nearest" });
+    pendingScroll.current = null;
+  }, [selectedSha, rows]);
+
   const onContext = (commit: Commit) => (e: React.MouseEvent) => {
     e.preventDefault();
     onSelect(commit.sha);
@@ -288,6 +319,12 @@ export function CommitGraph({
         text: "Copier le message",
         action: () => navigator.clipboard.writeText(commit.subject),
       },
+      ...(webLink
+        ? [
+            { separator: true as const },
+            { text: webLink.label, action: () => webLink.open(commit.sha) },
+          ]
+        : []),
     ]);
   };
 
@@ -303,7 +340,7 @@ export function CommitGraph({
   const wipColor = strokeFor(wipLane);
 
   return (
-    <div className="relative h-full overflow-auto">
+    <div ref={scroller} className="relative h-full overflow-auto">
       <div className="relative" style={{ minHeight: rows.length * ROW_H + offset }}>
         {/* Grab strip on the gutter's edge: narrows the graph, widens the
             messages. Sticky so it stays reachable while scrolled. */}
@@ -452,6 +489,7 @@ export function CommitGraph({
           return (
             <div
               key={commit.sha}
+              data-sha={commit.sha}
               onClick={() => onSelect(commit.sha)}
               onContextMenu={onContext(commit)}
               style={{ height: ROW_H, paddingLeft: gutter + GUTTER_GAP }}
@@ -532,7 +570,16 @@ export function CommitGraph({
             </div>
           );
         })}
+
+        {truncated && (
+          <p
+            style={{ paddingLeft: gutter + GUTTER_GAP }}
+            className="py-2 pr-3 text-[11px] text-ink-500"
+          >
+            Seuls les {rows.length} commits les plus récents sont affichés.
+          </p>
+        )}
       </div>
     </div>
   );
-}
+});

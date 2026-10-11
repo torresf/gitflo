@@ -53,10 +53,10 @@ export function branchTip(branch: Branch, currentBranch: string | null): TipCont
     rows,
     warning,
     hint: isCurrent
-      ? "Clic : filtrer le graphe · Clic droit : merge, rebase…"
+      ? "Clic : voir son dernier commit · Clic droit : merge, rebase…"
       : branch.worktreePath
-        ? "Clic : filtrer le graphe · Clic droit : actions"
-        : "Clic : filtrer · Double-clic : checkout · Clic droit : actions",
+        ? "Clic : voir son dernier commit · Clic droit : actions"
+        : "Clic : dernier commit · Double-clic : checkout · Clic droit : actions",
   };
 }
 

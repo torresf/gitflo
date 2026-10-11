@@ -47,7 +47,13 @@ export function PromptDialog({
           autoFocus
           value={value}
           onChange={(e) => setValue(e.target.value)}
-          onKeyDown={(e) => e.key === "Escape" && onCancel()}
+          onKeyDown={(e) => {
+            if (e.key !== "Escape") return;
+            // Only this dialog: the app-wide Escape would also close the
+            // detail panel underneath.
+            e.stopPropagation();
+            onCancel();
+          }}
           className="mt-3 w-full rounded-md border border-ink-600 bg-ink-900 px-2.5 py-1.5 font-mono text-[12px] text-ink-100 select-text focus:border-accent focus:outline-none"
         />
         <div className="mt-4 flex justify-end gap-2">

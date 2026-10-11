@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { AlertTriangle, CheckCircle2, X } from "lucide-react";
 
 export interface ToastState {
@@ -19,11 +19,17 @@ export function Toast({
   // Successes are transient; errors stay until dismissed so a merge conflict
   // message can actually be read. A toast offering an action also stays: it is
   // a prompt, not a notification.
+  //
+  // Keyed on the toast alone: the parent passes a new `onClose` on every
+  // render, and re-arming on it kept pushing the dismissal back while the app
+  // was refreshing.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     if (!toast || toast.kind === "error" || toast.action) return;
-    const timer = setTimeout(onClose, 3200);
+    const timer = setTimeout(() => onCloseRef.current(), 3200);
     return () => clearTimeout(timer);
-  }, [toast, onClose]);
+  }, [toast]);
 
   if (!toast) return null;
 

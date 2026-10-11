@@ -1,6 +1,6 @@
 [package]
 name = "gitflo"
-version = "0.1.0"
+version = "0.2.0"
 description = "Multi-repo git branch and commit viewer"
 authors = ["torresf"]
 license = "MIT"

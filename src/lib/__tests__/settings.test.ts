@@ -19,7 +19,9 @@ const state = (gutterWidth: number) => ({
   gutterWidth,
   collapsedRepos: [],
   richColors: false,
-  selectedPath: null,
+  autoFetch: true,
+  pullMode: "rebase" as const,
+  editor: "vscode" as const,
 });
 
 beforeEach(() => {
